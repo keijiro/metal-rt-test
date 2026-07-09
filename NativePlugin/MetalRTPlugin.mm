@@ -1,21 +1,28 @@
-// Metal hardware ray tracing path tracer plugin for Unity (stage 1: URP Lit
-// materials only)
+// Metal hardware ray tracing path tracer plugin for Unity (stage 2:
+// wavefront material evaluation with Unity-compiled compute shaders)
 //
 // Builds per-mesh primitive acceleration structures (BLAS) directly from
 // Unity mesh GPU buffers, combines them into an instance acceleration
 // structure (TLAS), and path-traces the scene with a wavefront-style
-// per-bounce kernel pipeline (RayGen -> [Intersect -> Shade]*N -> Resolve).
-// Surface evaluation is isolated in the Shade kernel behind a SurfaceData
-// boundary so that stage 2 can replace it with Unity-compiled material
-// evaluation. Mesh vertex/index buffers and material base maps are accessed
-// bindlessly (Metal 3 gpuAddress / gpuResourceID).
+// per-bounce kernel pipeline. The per-frame pipeline is split into phases
+// (Begin / Intersect / Shade / Resolve) driven by separate plugin render
+// events, so Unity-side compute dispatches (Shader Graph material
+// evaluation) can be interleaved between Intersect and Shade on the same
+// command stream:
 //
-// Execution paths:
-// - Synchronous (private queue + waitUntilCompleted): one-time BLAS builds,
-//   probe tests, material table setup.
-// - Render thread: the per-frame TLAS rebuild and the path tracing pipeline
-//   are encoded into Unity's own Metal command buffer from a plugin render
-//   event (CommandBuffer.IssuePluginEventAndData).
+//   Begin: TLAS rebuild, accumulation clear, RayGen
+//   per bounce:
+//     Intersect: TLAS intersection -> hit records (shared buffer)
+//                GeomPrep: attribute interpolation -> hit attributes
+//                          + default URP Lit surface evaluation
+//     (Unity dispatches material evaluation compute shaders here,
+//      overwriting surface records for their material indices)
+//     Shade: NEE + BSDF sampling from the surface records
+//   Resolve: progressive accumulation + tonemap to the output texture
+//
+// Hit records, hit attributes, and surface records live in Unity-created
+// GraphicsBuffers shared with this plugin by their native pointers, so both
+// the native kernels and Unity compute shaders can access them.
 
 #import <Metal/Metal.h>
 
@@ -30,14 +37,16 @@
 
 namespace {
 
-IUnityGraphicsMetalV1* s_Metal;
+IUnityGraphicsMetalV2* s_Metal;
 
 id<MTLDevice> s_Device;
-id<MTLCommandQueue> s_Queue;
+id<MTLCommandQueue> s_Queue;      // private queue (synchronous setup path)
+id<MTLCommandQueue> s_UnityQueue; // Unity's queue (render thread phases)
 
 id<MTLComputePipelineState> s_ClearPipeline;
 id<MTLComputePipelineState> s_RayGenPipeline;
 id<MTLComputePipelineState> s_IntersectPipeline;
+id<MTLComputePipelineState> s_GeomPrepPipeline;
 id<MTLComputePipelineState> s_ShadePipeline;
 id<MTLComputePipelineState> s_ResolvePipeline;
 id<MTLComputePipelineState> s_ProbePipeline;
@@ -47,8 +56,8 @@ struct MeshEntry
     id<MTLAccelerationStructure> blas;
     id<MTLBuffer> vertexBuffer;
     id<MTLBuffer> indexBuffer;
-    uint32_t vertexStride, positionOffset, normalOffset, uvOffset;
-    uint32_t indexFormat;
+    uint32_t vertexStride, positionOffset, normalOffset, tangentOffset;
+    uint32_t uvOffset, indexFormat;
 };
 
 // Written on the main thread during setup (before any render event fires),
@@ -59,11 +68,21 @@ std::vector<id<MTLTexture>> s_MaterialTextures;
 id<MTLAccelerationStructure> s_InstanceAS; // synchronous path only
 id<MTLBuffer> s_InstanceInfo;              // synchronous path only
 
-// Per-frame path tracing resources (render thread only)
+// Shared with Unity (GraphicsBuffer native pointers)
+id<MTLBuffer> s_SharedHits;
+id<MTLBuffer> s_SharedAttributes;
+id<MTLBuffer> s_SharedSurfaces;
+
+// Native-only per-frame resources (render thread)
 id<MTLBuffer> s_PathBuffer;
-id<MTLBuffer> s_HitBuffer;
 id<MTLBuffer> s_AccumBuffer;
 uint32_t s_BufferWidth, s_BufferHeight;
+
+// Per-frame state carried across the phase events of one frame
+// (render thread only).
+id<MTLAccelerationStructure> s_FrameTlas;
+id<MTLBuffer> s_FrameInfo;
+id<MTLTexture> s_FrameTexture;
 
 std::atomic<int> s_EventFrames {0};
 
@@ -72,6 +91,16 @@ std::string s_LastError;
 constexpr uint32_t kNoAttribute = 0xffffffffu;
 constexpr int kMaxEventInstances = 16;
 constexpr uint32_t kMaxBounceLimit = 8;
+
+// Render event phases; must match MetalRTPlugin.cs
+// (eventId = phase | bounce << 8).
+enum EventPhase
+{
+    kPhaseBegin = 0,
+    kPhaseIntersect = 1,
+    kPhaseShade = 2,
+    kPhaseResolve = 3,
+};
 
 // Must match TraceParams in MetalRTPlugin.cs and in the shader source.
 struct TraceParams
@@ -130,7 +159,7 @@ struct EventData
     float lightColor[4];   // 128: linear color * intensity
     uint32_t reset;        // 144
     uint32_t maxBounces;   // 148
-    uint32_t linearOutput; // 152: 1 = skip tonemap/sRGB (analytic tests)
+    uint32_t linearOutput; // 152: 1 = skip tonemap (analytic tests)
     uint32_t debugFlags;   // 156
     float exposure;        // 160
     float pad[3];          // 164..176
@@ -141,8 +170,9 @@ struct EventData
 struct GpuInstanceInfo
 {
     uint64_t vertices, indices;
-    uint32_t vertexStride, positionOffset, normalOffset, uvOffset;
-    uint32_t indexFormat, materialIndex, pad0, pad1;
+    uint32_t vertexStride, positionOffset, normalOffset, tangentOffset;
+    uint32_t uvOffset, indexFormat, materialIndex, pad;
+    float objectToWorld[3][4];
     float normalMatrix[3][4];
 };
 
@@ -170,6 +200,8 @@ struct FrameConstants
     float exposure;
     uint32_t pad[3];
 };
+
+FrameConstants s_Frame; // set at kPhaseBegin, reused by later phases
 
 constexpr const char* kShaderSource = R"msl(
 #include <metal_stdlib>
@@ -211,8 +243,9 @@ struct InstanceInfo
 {
     device const uchar* vertices;
     device const uchar* indices;
-    uint vertexStride, positionOffset, normalOffset, uvOffset;
-    uint indexFormat, materialIndex, pad0, pad1;
+    uint vertexStride, positionOffset, normalOffset, tangentOffset;
+    uint uvOffset, indexFormat, materialIndex, pad;
+    float4 objectToWorld0, objectToWorld1, objectToWorld2;
     float4 normalMatrix0, normalMatrix1, normalMatrix2;
 };
 
@@ -230,17 +263,36 @@ struct GpuMaterial
 // Per-pixel path state (w components carry rng state / alive flag).
 struct PathState
 {
-    float4 origin;     // w: unused
-    float4 direction;  // w: unused
+    float4 origin;
+    float4 direction;
     float4 throughput; // w: rng state (as_type)
     float4 radiance;   // w: alive flag
 };
 
+// Shared with Unity compute shaders; must match the HLSL declarations.
 struct HitRecord
 {
     float distance;
     uint instanceIndex, primitiveIndex, hit;
     float2 barycentric, pad;
+};
+
+struct HitAttributes
+{
+    float4 position; // xyz: world position
+    float4 normal;   // xyz: world shading normal (faces the ray origin)
+    float4 tangent;  // xyz: world tangent, w: bitangent sign
+    float4 uvView;   // xy: uv0
+    float4 viewDir;  // xyz: direction toward the ray origin
+    uint4 meta;      // x: material index, y: hit flag
+};
+
+struct SurfaceRecord
+{
+    float4 baseColor; // rgb: linear albedo
+    float4 normal;    // xyz: world shading normal
+    float4 emission;  // rgb: linear radiance
+    float4 params;    // x: metallic, y: smoothness
 };
 
 // --- RNG (PCG) ---
@@ -286,81 +338,20 @@ static float3 LoadFloat3Attr
     return *p;
 }
 
+static float4 LoadFloat4Attr
+  (constant InstanceInfo& info, uint offset, uint index)
+{
+    device const packed_float4* p = (device const packed_float4*)
+      (info.vertices + info.vertexStride * index + offset);
+    return *p;
+}
+
 static float2 LoadFloat2Attr
   (constant InstanceInfo& info, uint offset, uint index)
 {
     device const packed_float2* p = (device const packed_float2*)
       (info.vertices + info.vertexStride * index + offset);
     return *p;
-}
-
-// --- Surface evaluation (stage 2 boundary: this is the part that will be
-// --- replaced by Unity-compiled material evaluation) ---
-
-struct SurfaceData
-{
-    float3 position;   // world space
-    float3 normal;     // world space shading normal (faces the ray origin)
-    float3 baseColor;  // linear, texture applied
-    float3 emission;   // linear
-    float metallic;
-    float smoothness;
-};
-
-static SurfaceData EvaluateSurface
-  (constant InstanceInfo& info, constant GpuMaterial* materials,
-   thread const HitRecord& hit, float3 rayOrigin, float3 rayDir)
-{
-    uint3 tri = LoadTriangleIndices(info, hit.primitiveIndex);
-    float3 bary = float3(1 - hit.barycentric.x - hit.barycentric.y,
-                         hit.barycentric.x, hit.barycentric.y);
-
-    // Geometric normal (object space)
-    float3 p0 = LoadFloat3Attr(info, info.positionOffset, tri.x);
-    float3 p1 = LoadFloat3Attr(info, info.positionOffset, tri.y);
-    float3 p2 = LoadFloat3Attr(info, info.positionOffset, tri.z);
-    float3 n = cross(p1 - p0, p2 - p0);
-
-    // Interpolated vertex normal when available
-    if (info.normalOffset != 0xffffffffu)
-    {
-        float3 n0 = LoadFloat3Attr(info, info.normalOffset, tri.x);
-        float3 n1 = LoadFloat3Attr(info, info.normalOffset, tri.y);
-        float3 n2 = LoadFloat3Attr(info, info.normalOffset, tri.z);
-        float3 sn = n0 * bary.x + n1 * bary.y + n2 * bary.z;
-        if (dot(sn, n) < 0) n = -n;
-        n = sn;
-    }
-
-    // Object -> world normal transform (inverse transpose rows)
-    n = float3(dot(info.normalMatrix0.xyz, n),
-               dot(info.normalMatrix1.xyz, n),
-               dot(info.normalMatrix2.xyz, n));
-    n = normalize(n);
-    if (dot(n, rayDir) > 0) n = -n;
-
-    constant GpuMaterial& mat = materials[info.materialIndex];
-
-    float3 baseColor = mat.baseColor.xyz;
-    if (mat.hasBaseMap != 0 && info.uvOffset != 0xffffffffu)
-    {
-        float2 uv0 = LoadFloat2Attr(info, info.uvOffset, tri.x);
-        float2 uv1 = LoadFloat2Attr(info, info.uvOffset, tri.y);
-        float2 uv2 = LoadFloat2Attr(info, info.uvOffset, tri.z);
-        float2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
-        uv = uv * mat.baseMapST.xy + mat.baseMapST.zw;
-        constexpr sampler smp(address::repeat, filter::linear, mip_filter::linear);
-        baseColor *= mat.baseMap.sample(smp, uv, level(2)).xyz;
-    }
-
-    SurfaceData surf;
-    surf.position = rayOrigin + rayDir * hit.distance;
-    surf.normal = n;
-    surf.baseColor = baseColor;
-    surf.emission = mat.emission.xyz;
-    surf.metallic = mat.metallic;
-    surf.smoothness = mat.smoothness;
-    return surf;
 }
 
 // --- BSDF: URP Lit compatible metallic-roughness GGX + Lambert ---
@@ -372,12 +363,13 @@ struct Bsdf
     float alpha;    // GGX alpha (perceptual roughness squared)
 };
 
-static Bsdf MakeBsdf(thread const SurfaceData& surf, uint debugFlags)
+static Bsdf MakeBsdf(float3 baseColor, float metallic, float smoothness,
+                     uint debugFlags)
 {
     Bsdf b;
-    b.diffuse = surf.baseColor * (1 - surf.metallic);
-    b.f0 = mix(float3(0.04), surf.baseColor, surf.metallic);
-    float perceptual = 1 - surf.smoothness;
+    b.diffuse = baseColor * (1 - metallic);
+    b.f0 = mix(float3(0.04), baseColor, metallic);
+    float perceptual = 1 - smoothness;
     b.alpha = max(perceptual * perceptual, 1e-3);
     if (debugFlags & 1) // diffuse only (analytic tests)
         b.f0 = float3(0);
@@ -402,7 +394,6 @@ static float SmithG(float alpha, float nov, float nol)
 static float3 Fresnel(float3 f0, float voh)
   { return f0 + (1 - f0) * pow(1 - voh, 5.0); }
 
-// Full BSDF value for given directions (used by next event estimation).
 static float3 EvalBsdf(thread const Bsdf& b, float3 n, float3 wo, float3 wi)
 {
     float nol = dot(n, wi);
@@ -419,7 +410,7 @@ static float3x3 MakeBasis(float3 n)
     float3 t = abs(n.y) < 0.99 ? normalize(cross(n, float3(0, 1, 0)))
                                : float3(1, 0, 0);
     float3 bt = cross(t, n);
-    return float3x3(t, bt, n); // columns: tangent, bitangent, normal
+    return float3x3(t, bt, n);
 }
 
 static float3 SampleCosine(thread uint& rng, float3 n)
@@ -444,8 +435,6 @@ static float3 SampleGgxHalf(thread uint& rng, float3 n, float alpha)
 static float Luminance(float3 c)
   { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
-// Samples the next bounce direction and returns the throughput multiplier
-// (f * cos / pdf, including the lobe selection probability).
 static float3 SampleBsdf(thread const Bsdf& b, thread uint& rng,
                          float3 n, float3 wo, thread float3& wi)
 {
@@ -461,8 +450,6 @@ static float3 SampleBsdf(thread const Bsdf& b, thread uint& rng,
         float nol = dot(n, wi);
         float nov = dot(n, wo);
         if (nol <= 0 || nov <= 0) return float3(0);
-        // pdf = D * NoH / (4 * VoH); f = D*G*F / (4*NoV*NoL)
-        // f * cos / pdf = G * F * VoH / (NoV * NoH)
         float voh = max(dot(wo, h), 1e-4);
         float noh = max(dot(n, h), 1e-4);
         float3 w = SmithG(b.alpha, nov, nol) * Fresnel(b.f0, voh) *
@@ -473,7 +460,6 @@ static float3 SampleBsdf(thread const Bsdf& b, thread uint& rng,
     {
         wi = SampleCosine(rng, n);
         if (dot(n, wi) <= 0) return float3(0);
-        // pdf = cos/pi; f = diffuse/pi -> f * cos / pdf = diffuse
         return b.diffuse / max(1 - pSpec, 1e-3);
     }
 }
@@ -550,14 +536,117 @@ kernel void Intersect
     hits[idx] = rec;
 }
 
+// Interpolates hit point attributes and evaluates the default URP Lit
+// material into the surface record. Unity-side material evaluation compute
+// shaders may overwrite surface records afterwards (before Shade).
+kernel void GeomPrep
+  (device const PathState* paths [[buffer(0)]],
+   device const HitRecord* hits [[buffer(1)]],
+   constant InstanceInfo* instances [[buffer(2)]],
+   constant GpuMaterial* materials [[buffer(3)]],
+   constant FrameConstants& frame [[buffer(4)]],
+   device HitAttributes* attributes [[buffer(5)]],
+   device SurfaceRecord* surfaces [[buffer(6)]],
+   uint2 id [[thread_position_in_grid]])
+{
+    if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
+    uint idx = id.y * frame.cam.width + id.x;
+
+    HitAttributes attr = {};
+    SurfaceRecord surf = {};
+
+    PathState path = paths[idx];
+    HitRecord hit = hits[idx];
+
+    if (path.radiance.w != 0 && hit.hit != 0)
+    {
+        constant InstanceInfo& info = instances[hit.instanceIndex];
+        uint3 tri = LoadTriangleIndices(info, hit.primitiveIndex);
+        float3 bary = float3(1 - hit.barycentric.x - hit.barycentric.y,
+                             hit.barycentric.x, hit.barycentric.y);
+
+        // Geometric normal (object space)
+        float3 p0 = LoadFloat3Attr(info, info.positionOffset, tri.x);
+        float3 p1 = LoadFloat3Attr(info, info.positionOffset, tri.y);
+        float3 p2 = LoadFloat3Attr(info, info.positionOffset, tri.z);
+        float3 n = cross(p1 - p0, p2 - p0);
+
+        // Interpolated vertex normal when available
+        if (info.normalOffset != 0xffffffffu)
+        {
+            float3 n0 = LoadFloat3Attr(info, info.normalOffset, tri.x);
+            float3 n1 = LoadFloat3Attr(info, info.normalOffset, tri.y);
+            float3 n2 = LoadFloat3Attr(info, info.normalOffset, tri.z);
+            float3 sn = n0 * bary.x + n1 * bary.y + n2 * bary.z;
+            if (dot(sn, n) < 0) n = -n;
+            n = sn;
+        }
+
+        n = float3(dot(info.normalMatrix0.xyz, n),
+                   dot(info.normalMatrix1.xyz, n),
+                   dot(info.normalMatrix2.xyz, n));
+        n = normalize(n);
+        if (dot(n, path.direction.xyz) > 0) n = -n;
+
+        // Tangent (world space)
+        float4 tangent = float4(1, 0, 0, 1);
+        if (info.tangentOffset != 0xffffffffu)
+        {
+            float4 t0 = LoadFloat4Attr(info, info.tangentOffset, tri.x);
+            float4 t1 = LoadFloat4Attr(info, info.tangentOffset, tri.y);
+            float4 t2 = LoadFloat4Attr(info, info.tangentOffset, tri.z);
+            float4 ts = t0 * bary.x + t1 * bary.y + t2 * bary.z;
+            float3 tw = float3(dot(info.objectToWorld0.xyz, ts.xyz),
+                               dot(info.objectToWorld1.xyz, ts.xyz),
+                               dot(info.objectToWorld2.xyz, ts.xyz));
+            tangent = float4(normalize(tw), ts.w);
+        }
+
+        // UV0
+        float2 uv = float2(0);
+        if (info.uvOffset != 0xffffffffu)
+        {
+            float2 uv0 = LoadFloat2Attr(info, info.uvOffset, tri.x);
+            float2 uv1 = LoadFloat2Attr(info, info.uvOffset, tri.y);
+            float2 uv2 = LoadFloat2Attr(info, info.uvOffset, tri.z);
+            uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+        }
+
+        attr.position = float4(path.origin.xyz +
+                               path.direction.xyz * hit.distance, 1);
+        attr.normal = float4(n, 0);
+        attr.tangent = tangent;
+        attr.uvView = float4(uv, 0, 0);
+        attr.viewDir = float4(-path.direction.xyz, 0);
+        attr.meta = uint4(info.materialIndex, 1, 0, 0);
+
+        // Default URP Lit surface evaluation
+        constant GpuMaterial& mat = materials[info.materialIndex];
+        float3 baseColor = mat.baseColor.xyz;
+        if (mat.hasBaseMap != 0 && info.uvOffset != 0xffffffffu)
+        {
+            float2 st = uv * mat.baseMapST.xy + mat.baseMapST.zw;
+            constexpr sampler smp(address::repeat, filter::linear,
+                                  mip_filter::linear);
+            baseColor *= mat.baseMap.sample(smp, st, level(2)).xyz;
+        }
+        surf.baseColor = float4(baseColor, 1);
+        surf.normal = float4(n, 0);
+        surf.emission = mat.emission;
+        surf.params = float4(mat.metallic, mat.smoothness, 0, 0);
+    }
+
+    attributes[idx] = attr;
+    surfaces[idx] = surf;
+}
+
 kernel void Shade
   (instance_acceleration_structure accel [[buffer(0)]],
    device PathState* paths [[buffer(1)]],
-   device const HitRecord* hits [[buffer(2)]],
-   constant InstanceInfo* instances [[buffer(3)]],
-   constant GpuMaterial* materials [[buffer(4)]],
-   constant FrameConstants& frame [[buffer(5)]],
-   constant uint& bounce [[buffer(6)]],
+   device const HitAttributes* attributes [[buffer(2)]],
+   device const SurfaceRecord* surfaces [[buffer(3)]],
+   constant FrameConstants& frame [[buffer(4)]],
+   constant uint& bounce [[buffer(5)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
@@ -566,8 +655,8 @@ kernel void Shade
     PathState path = paths[idx];
     if (path.radiance.w == 0) return;
 
-    HitRecord hit = hits[idx];
-    if (hit.hit == 0)
+    HitAttributes attr = attributes[idx];
+    if (attr.meta.y == 0)
     {
         path.radiance.xyz += path.throughput.xyz * frame.envColor.xyz;
         path.radiance.w = 0;
@@ -575,23 +664,24 @@ kernel void Shade
         return;
     }
 
-    constant InstanceInfo& info = instances[hit.instanceIndex];
-    SurfaceData surf = EvaluateSurface(info, materials, hit,
-                                       path.origin.xyz, path.direction.xyz);
+    SurfaceRecord surf = surfaces[idx];
+    float3 position = attr.position.xyz;
+    float3 normal = normalize(surf.normal.xyz);
 
     uint rng = as_type<uint>(path.throughput.w);
     float3 wo = -path.direction.xyz;
-    Bsdf bsdf = MakeBsdf(surf, frame.debugFlags);
+    Bsdf bsdf = MakeBsdf(surf.baseColor.xyz, surf.params.x, surf.params.y,
+                         frame.debugFlags);
 
-    path.radiance.xyz += path.throughput.xyz * surf.emission;
+    path.radiance.xyz += path.throughput.xyz * surf.emission.xyz;
 
     // Next event estimation for the directional light
     float3 wl = -frame.lightDir.xyz;
-    float nol = dot(surf.normal, wl);
+    float nol = dot(normal, wl);
     if (nol > 0 && Luminance(frame.lightColor.xyz) > 0)
     {
         ray shadow;
-        shadow.origin = surf.position + surf.normal * kRayEpsilon;
+        shadow.origin = position + normal * kRayEpsilon;
         shadow.direction = wl;
         shadow.min_distance = 0;
         shadow.max_distance = INFINITY;
@@ -603,8 +693,7 @@ kernel void Shade
 
         if (sh.type == intersection_type::none)
             path.radiance.xyz += path.throughput.xyz *
-              EvalBsdf(bsdf, surf.normal, wo, wl) * nol *
-              frame.lightColor.xyz;
+              EvalBsdf(bsdf, normal, wo, wl) * nol * frame.lightColor.xyz;
     }
 
     // Sample the next bounce
@@ -615,7 +704,7 @@ kernel void Shade
     else
     {
         float3 wi;
-        float3 weight = SampleBsdf(bsdf, rng, surf.normal, wo, wi);
+        float3 weight = SampleBsdf(bsdf, rng, normal, wo, wi);
         if (Luminance(weight) <= 0)
         {
             path.radiance.w = 0;
@@ -623,7 +712,7 @@ kernel void Shade
         else
         {
             path.throughput.xyz *= weight;
-            path.origin.xyz = surf.position + surf.normal * kRayEpsilon;
+            path.origin.xyz = position + normal * kRayEpsilon;
             path.direction.xyz = wi;
         }
     }
@@ -634,7 +723,6 @@ kernel void Shade
 
 static float3 TonemapAces(float3 x)
 {
-    // Narkowicz ACES approximation
     return saturate(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14));
 }
 
@@ -653,16 +741,13 @@ kernel void Resolve
     acc.w += 1;
     accum[idx] = acc;
 
-    // Output stays linear; Unity's sRGB conversion happens at display time
-    // (linear color space project), and the PNG writer encodes explicitly.
+    // Output stays linear; Unity's sRGB conversion happens at display time.
     float3 color = acc.xyz / acc.w;
     if (frame.linearOutput == 0)
         color = TonemapAces(color * frame.exposure);
     output.write(float4(color, 1), id);
 }
 
-// Probe rays (world space origin/direction float4 pairs); intersection
-// regression test path.
 kernel void TraceProbes
   (instance_acceleration_structure accel [[buffer(0)]],
    device ProbeResult* output [[buffer(1)]],
@@ -704,7 +789,7 @@ bool EnsureDevice()
 
     if (s_Metal == nullptr)
     {
-        SetError(@"IUnityGraphicsMetalV1 interface is not available.");
+        SetError(@"IUnityGraphicsMetalV2 interface is not available.");
         return false;
     }
 
@@ -716,6 +801,7 @@ bool EnsureDevice()
     }
 
     s_Queue = [s_Device newCommandQueue];
+    s_UnityQueue = s_Metal->CommandQueue();
     return true;
 }
 
@@ -757,12 +843,14 @@ bool EnsurePipelines()
     s_ClearPipeline = CreatePipeline(library, @"ClearAccum");
     s_RayGenPipeline = CreatePipeline(library, @"RayGen");
     s_IntersectPipeline = CreatePipeline(library, @"Intersect");
+    s_GeomPrepPipeline = CreatePipeline(library, @"GeomPrep");
     s_ShadePipeline = CreatePipeline(library, @"Shade");
     s_ResolvePipeline = CreatePipeline(library, @"Resolve");
     s_ProbePipeline = CreatePipeline(library, @"TraceProbes");
     return s_ClearPipeline != nil && s_RayGenPipeline != nil &&
-           s_IntersectPipeline != nil && s_ShadePipeline != nil &&
-           s_ResolvePipeline != nil && s_ProbePipeline != nil;
+           s_IntersectPipeline != nil && s_GeomPrepPipeline != nil &&
+           s_ShadePipeline != nil && s_ResolvePipeline != nil &&
+           s_ProbePipeline != nil;
 }
 
 bool RunCommandBuffer(id<MTLCommandBuffer> command)
@@ -778,8 +866,6 @@ bool RunCommandBuffer(id<MTLCommandBuffer> command)
     return true;
 }
 
-// Fills Metal instance descriptors and the shader-side instance records
-// from marshaled instance data. Returns nil on error.
 MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
   (const InstanceDesc* instances, int32_t count, id<MTLBuffer>* outInfo)
 {
@@ -822,9 +908,12 @@ MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
         info.vertexStride = mesh.vertexStride;
         info.positionOffset = mesh.positionOffset;
         info.normalOffset = mesh.normalOffset;
+        info.tangentOffset = mesh.tangentOffset;
         info.uvOffset = mesh.uvOffset;
         info.indexFormat = mesh.indexFormat;
         info.materialIndex = std::max(src.materialIndex, 0);
+        std::memcpy(info.objectToWorld, src.objectToWorld,
+                    sizeof(info.objectToWorld));
         std::memcpy(info.normalMatrix, src.normalMatrix,
                     sizeof(info.normalMatrix));
     }
@@ -842,7 +931,6 @@ MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
     return descriptor;
 }
 
-// Encodes an acceleration structure build onto the given command buffer.
 id<MTLAccelerationStructure> EncodeAccelerationStructureBuild
   (id<MTLCommandBuffer> command, MTLAccelerationStructureDescriptor* descriptor)
 {
@@ -888,8 +976,6 @@ void EnsurePathBuffers(uint32_t width, uint32_t height)
     NSUInteger pixels = (NSUInteger)width * height;
     s_PathBuffer = [s_Device newBufferWithLength:pixels * 64
                                          options:MTLResourceStorageModePrivate];
-    s_HitBuffer = [s_Device newBufferWithLength:pixels * 32
-                                        options:MTLResourceStorageModePrivate];
     s_AccumBuffer = [s_Device newBufferWithLength:pixels * 16
                                           options:MTLResourceStorageModePrivate];
     s_BufferWidth = width;
@@ -908,108 +994,170 @@ void UseSceneResources(id<MTLComputeCommandEncoder> encoder)
         [encoder useResource:texture usage:MTLResourceUsageRead];
 }
 
+// Commits Unity's current command buffer (so everything Unity encoded so
+// far — including material evaluation dispatches — is ordered before us)
+// and returns a fresh command buffer of our own on Unity's queue. The queue
+// executes command buffers in commit order, so the phase pipeline stays
+// GPU-ordered without ever touching Unity's encoder state.
+id<MTLCommandBuffer> BeginPhaseCommandBuffer()
+{
+    s_Metal->CommitCurrentCommandBuffer();
+    return [s_UnityQueue commandBuffer];
+}
+
 // Render thread entry point (CommandBuffer.IssuePluginEventAndData).
-// Encodes the per-frame TLAS rebuild and the whole path tracing pipeline
-// into Unity's current Metal command buffer.
+// eventId = phase | bounce << 8. The phases of one frame are issued as
+// separate events so Unity compute dispatches (material evaluation) can be
+// interleaved between Intersect and Shade on the same command stream.
 void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
 {
     if (s_Metal == nullptr || data == nullptr) return;
     if (!EnsureDevice() || !EnsurePipelines()) return;
 
-    const auto* ev = (const EventData*)data;
-    if (ev->instanceCount <= 0 || ev->instanceCount > kMaxEventInstances)
-        return;
-    if (s_MaterialBuffer == nil) return;
+    if (s_SharedHits == nil || s_SharedAttributes == nil ||
+        s_SharedSurfaces == nil || s_MaterialBuffer == nil) return;
 
-    id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)ev->texture;
-    if (texture == nil || !(texture.usage & MTLTextureUsageShaderWrite))
-        return;
+    const auto* ev = (const EventData*)data;
+    int phase = eventId & 0xff;
+    uint32_t bounce = (uint32_t)(eventId >> 8);
 
     uint32_t width = ev->params.width, height = ev->params.height;
-    bool resized = width != s_BufferWidth || height != s_BufferHeight;
-    EnsurePathBuffers(width, height);
-
-    id<MTLBuffer> info = nil;
-    MTLInstanceAccelerationStructureDescriptor* descriptor =
-      CreateInstanceDescriptor(ev->instances, ev->instanceCount, &info);
-    if (descriptor == nil) return;
-
-    FrameConstants frame = {};
-    frame.cam = ev->params;
-    std::memcpy(frame.envColor, ev->envColor, sizeof(float) * 12);
-    frame.frameIndex = ev->frameIndex;
-    frame.maxBounces = std::min(std::max(ev->maxBounces, 1u), kMaxBounceLimit);
-    frame.linearOutput = ev->linearOutput;
-    frame.debugFlags = ev->debugFlags;
-    frame.exposure = ev->exposure;
-
-    // End Unity's in-flight encoder so we can put our own encoders on its
-    // command buffer; Unity opens a new encoder afterwards as needed.
-    s_Metal->EndCurrentCommandEncoder();
-    id<MTLCommandBuffer> command = s_Metal->CurrentCommandBuffer();
-    if (command == nil) return;
-
-    id<MTLAccelerationStructure> tlas =
-      EncodeAccelerationStructureBuild(command, descriptor);
-    if (tlas == nil) return;
-
-    id<MTLComputeCommandEncoder> enc = [command computeCommandEncoder];
-    UseSceneResources(enc);
-    [enc useResource:tlas usage:MTLResourceUsageRead];
-
     MTLSize grid = MTLSizeMake(width, height, 1);
     MTLSize group = MTLSizeMake(8, 8, 1);
 
-    auto barrier = ^{
+    auto barrier = ^(id<MTLComputeCommandEncoder> enc) {
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     };
 
-    if (ev->reset != 0 || resized)
+    if (phase == kPhaseBegin)
     {
-        [enc setComputePipelineState:s_ClearPipeline];
-        [enc setBuffer:s_AccumBuffer offset:0 atIndex:0];
-        [enc setBytes:&frame length:sizeof(frame) atIndex:1];
+        if (ev->instanceCount <= 0 || ev->instanceCount > kMaxEventInstances)
+            return;
+
+        s_FrameTexture = (__bridge id<MTLTexture>)(void*)ev->texture;
+        if (s_FrameTexture == nil ||
+            !(s_FrameTexture.usage & MTLTextureUsageShaderWrite))
+        {
+            s_FrameTexture = nil;
+            return;
+        }
+
+        bool resized = width != s_BufferWidth || height != s_BufferHeight;
+        EnsurePathBuffers(width, height);
+
+        s_Frame = {};
+        s_Frame.cam = ev->params;
+        std::memcpy(s_Frame.envColor, ev->envColor, sizeof(float) * 12);
+        s_Frame.frameIndex = ev->frameIndex;
+        s_Frame.maxBounces =
+          std::min(std::max(ev->maxBounces, 1u), kMaxBounceLimit);
+        s_Frame.linearOutput = ev->linearOutput;
+        s_Frame.debugFlags = ev->debugFlags;
+        s_Frame.exposure = ev->exposure;
+
+        id<MTLBuffer> info = nil;
+        MTLInstanceAccelerationStructureDescriptor* descriptor =
+          CreateInstanceDescriptor(ev->instances, ev->instanceCount, &info);
+        if (descriptor == nil) return;
+
+        id<MTLCommandBuffer> command = BeginPhaseCommandBuffer();
+        if (command == nil) return;
+
+        s_FrameTlas = EncodeAccelerationStructureBuild(command, descriptor);
+        if (s_FrameTlas == nil) return;
+        s_FrameInfo = info;
+
+        id<MTLComputeCommandEncoder> enc = [command computeCommandEncoder];
+
+        if (ev->reset != 0 || resized)
+        {
+            [enc setComputePipelineState:s_ClearPipeline];
+            [enc setBuffer:s_AccumBuffer offset:0 atIndex:0];
+            [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:1];
+            [enc dispatchThreads:grid threadsPerThreadgroup:group];
+            barrier(enc);
+        }
+
+        [enc setComputePipelineState:s_RayGenPipeline];
+        [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:1];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
-        barrier();
+        [enc endEncoding];
+        [command commit];
     }
-
-    [enc setComputePipelineState:s_RayGenPipeline];
-    [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
-    [enc setBytes:&frame length:sizeof(frame) atIndex:1];
-    [enc dispatchThreads:grid threadsPerThreadgroup:group];
-
-    for (uint32_t bounce = 0; bounce < frame.maxBounces; bounce++)
+    else if (phase == kPhaseIntersect)
     {
-        barrier();
+        if (s_FrameTlas == nil) return;
+
+        id<MTLCommandBuffer> command = BeginPhaseCommandBuffer();
+        if (command == nil) return;
+        id<MTLComputeCommandEncoder> enc = [command computeCommandEncoder];
+
+        UseSceneResources(enc);
+        [enc useResource:s_FrameTlas usage:MTLResourceUsageRead];
+
         [enc setComputePipelineState:s_IntersectPipeline];
-        [enc setAccelerationStructure:tlas atBufferIndex:0];
+        [enc setAccelerationStructure:s_FrameTlas atBufferIndex:0];
         [enc setBuffer:s_PathBuffer offset:0 atIndex:1];
-        [enc setBuffer:s_HitBuffer offset:0 atIndex:2];
-        [enc setBytes:&frame length:sizeof(frame) atIndex:3];
+        [enc setBuffer:s_SharedHits offset:0 atIndex:2];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:3];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
 
-        barrier();
-        [enc setComputePipelineState:s_ShadePipeline];
-        [enc setAccelerationStructure:tlas atBufferIndex:0];
-        [enc setBuffer:s_PathBuffer offset:0 atIndex:1];
-        [enc setBuffer:s_HitBuffer offset:0 atIndex:2];
-        [enc setBuffer:info offset:0 atIndex:3];
-        [enc setBuffer:s_MaterialBuffer offset:0 atIndex:4];
-        [enc setBytes:&frame length:sizeof(frame) atIndex:5];
-        [enc setBytes:&bounce length:sizeof(bounce) atIndex:6];
+        barrier(enc);
+
+        [enc setComputePipelineState:s_GeomPrepPipeline];
+        [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
+        [enc setBuffer:s_SharedHits offset:0 atIndex:1];
+        [enc setBuffer:s_FrameInfo offset:0 atIndex:2];
+        [enc setBuffer:s_MaterialBuffer offset:0 atIndex:3];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:4];
+        [enc setBuffer:s_SharedAttributes offset:0 atIndex:5];
+        [enc setBuffer:s_SharedSurfaces offset:0 atIndex:6];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        [enc endEncoding];
+        [command commit];
     }
+    else if (phase == kPhaseShade)
+    {
+        if (s_FrameTlas == nil) return;
 
-    barrier();
-    [enc setComputePipelineState:s_ResolvePipeline];
-    [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
-    [enc setBuffer:s_AccumBuffer offset:0 atIndex:1];
-    [enc setBytes:&frame length:sizeof(frame) atIndex:2];
-    [enc setTexture:texture atIndex:0];
-    [enc dispatchThreads:grid threadsPerThreadgroup:group];
-    [enc endEncoding];
+        id<MTLCommandBuffer> command = BeginPhaseCommandBuffer();
+        if (command == nil) return;
+        id<MTLComputeCommandEncoder> enc = [command computeCommandEncoder];
 
-    s_EventFrames.fetch_add(1, std::memory_order_relaxed);
+        UseSceneResources(enc);
+        [enc useResource:s_FrameTlas usage:MTLResourceUsageRead];
+
+        [enc setComputePipelineState:s_ShadePipeline];
+        [enc setAccelerationStructure:s_FrameTlas atBufferIndex:0];
+        [enc setBuffer:s_PathBuffer offset:0 atIndex:1];
+        [enc setBuffer:s_SharedAttributes offset:0 atIndex:2];
+        [enc setBuffer:s_SharedSurfaces offset:0 atIndex:3];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:4];
+        [enc setBytes:&bounce length:sizeof(bounce) atIndex:5];
+        [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        [enc endEncoding];
+        [command commit];
+    }
+    else if (phase == kPhaseResolve)
+    {
+        if (s_FrameTexture == nil) return;
+
+        id<MTLCommandBuffer> command = BeginPhaseCommandBuffer();
+        if (command == nil) return;
+        id<MTLComputeCommandEncoder> enc = [command computeCommandEncoder];
+
+        [enc setComputePipelineState:s_ResolvePipeline];
+        [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
+        [enc setBuffer:s_AccumBuffer offset:0 atIndex:1];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:2];
+        [enc setTexture:s_FrameTexture atIndex:0];
+        [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        [enc endEncoding];
+        [command commit];
+
+        s_EventFrames.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 } // anonymous namespace
@@ -1019,7 +1167,7 @@ extern "C" {
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 UnityPluginLoad(IUnityInterfaces* interfaces)
 {
-    s_Metal = interfaces->Get<IUnityGraphicsMetalV1>();
+    s_Metal = interfaces->Get<IUnityGraphicsMetalV2>();
 }
 
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload()
@@ -1047,7 +1195,7 @@ MetalRT_DeviceSupportsRaytracing()
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_AddMesh
   (void* vertexBuffer, uint32_t vertexStride, uint32_t positionOffset,
-   uint32_t normalOffset, uint32_t uvOffset,
+   uint32_t normalOffset, uint32_t tangentOffset, uint32_t uvOffset,
    void* indexBuffer, uint32_t indexFormat, uint32_t indexByteOffset,
    uint32_t triangleCount)
 {
@@ -1065,6 +1213,7 @@ MetalRT_AddMesh
     mesh.vertexStride = vertexStride;
     mesh.positionOffset = positionOffset;
     mesh.normalOffset = normalOffset;
+    mesh.tangentOffset = tangentOffset;
     mesh.uvOffset = uvOffset;
     mesh.indexFormat = indexFormat;
 
@@ -1129,6 +1278,22 @@ MetalRT_SetMaterials(const MaterialDesc* materials, int32_t count)
     return 0;
 }
 
+// Registers the GraphicsBuffers shared with Unity compute shaders
+// (hit records, hit attributes, surface records).
+int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
+MetalRT_SetSharedBuffers(void* hits, void* attributes, void* surfaces)
+{
+    if (hits == nullptr || attributes == nullptr || surfaces == nullptr)
+    {
+        SetError(@"Shared buffer pointer is null.");
+        return -1;
+    }
+    s_SharedHits = (__bridge id<MTLBuffer>)hits;
+    s_SharedAttributes = (__bridge id<MTLBuffer>)attributes;
+    s_SharedSurfaces = (__bridge id<MTLBuffer>)surfaces;
+    return 0;
+}
+
 // Synchronously (re)builds the instance acceleration structure used by the
 // probe test path.
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
@@ -1187,14 +1352,12 @@ MetalRT_TraceProbes(const float* rays, int32_t count, ProbeResult* results)
     return 0;
 }
 
-// Returns the render event callback for CommandBuffer.IssuePluginEventAndData.
 UnityRenderingEventAndData UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_GetRenderEventFunc()
 {
     return OnRenderEvent;
 }
 
-// Number of render events executed so far (verifies the render thread path).
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_GetEventFrameCount()
 {
@@ -1208,9 +1371,14 @@ void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
     s_MaterialBuffer = nil;
     s_MaterialTextures.clear();
     s_Meshes.clear();
+    s_SharedHits = nil;
+    s_SharedAttributes = nil;
+    s_SharedSurfaces = nil;
     s_PathBuffer = nil;
-    s_HitBuffer = nil;
     s_AccumBuffer = nil;
+    s_FrameTlas = nil;
+    s_FrameInfo = nil;
+    s_FrameTexture = nil;
     s_BufferWidth = s_BufferHeight = 0;
     s_EventFrames.store(0, std::memory_order_relaxed);
 }

@@ -5,21 +5,22 @@ HDRP-path-tracing-like feature for URP.
 
 ![comparison](Images/comparison.png)
 
-*Left: URP real-time rasterization. Right: the Metal RT path tracer rendering
-the same scene with the same URP/Lit materials (soft shadows, GI color
-bleeding, emissive lighting, and mirror reflections).*
+*Left: URP real-time rasterization. Right: the Metal RT path tracer. The
+checkerboard floor uses a Shader Graph: URP rasterizes it with the graph's
+own shader while the path tracer evaluates a compute shader automatically
+generated from the same graph — both views match. The path traced view adds
+soft shadows, GI color bleeding, emissive lighting, and mirror reflections.*
 
 ## Overview
 
 This project verifies, step by step, that hardware ray tracing on macOS
 (Apple Silicon) can cooperate with Unity — starting from building
-acceleration structures out of non-readable Unity meshes and ending (so far)
-at a progressive path tracer that consumes real URP/Lit materials and runs
-inside Unity's own Metal command stream.
-
-Current stage: **stage 1 — Lit-materials-only path tracer**. The next stage
-is conditional Shader Graph support through wavefront-style material
-evaluation with Unity-compiled compute shaders.
+acceleration structures out of non-readable Unity meshes, through a
+progressive path tracer that consumes real URP/Lit materials inside Unity's
+own Metal command stream, and now including **conditional Shader Graph
+support**: material evaluation runs as Unity-compiled compute shaders
+interleaved with the native ray tracing kernels (wavefront style), and those
+compute shaders can be generated automatically from Shader Graph assets.
 
 ## Background
 
@@ -38,42 +39,56 @@ project.
 ## How it works
 
 - `NativePlugin/MetalRTPlugin.mm` — The native plugin. It obtains Unity's
-  `MTLDevice` through `IUnityGraphicsMetalV1` and implements the whole path
-  tracer as runtime-compiled MSL compute kernels:
+  `MTLDevice` and command queue through `IUnityGraphicsMetalV2` and
+  implements the ray tracing side as runtime-compiled MSL compute kernels:
   - **Acceleration structures**: per-mesh BLASes are built directly from the
     GPU buffers of non-readable Unity meshes
     (`Mesh.GetNativeVertexBufferPtr` / `GetNativeIndexBufferPtr` — no CPU
     copy of the geometry ever exists), then combined into a TLAS with
     per-instance transforms.
-  - **Wavefront-style pipeline**: per frame, `RayGen` emits jittered camera
-    rays, then `Intersect` / `Shade` alternate per bounce over path state
-    buffers, and `Resolve` accumulates into a progressive HDR buffer and
-    writes the tonemapped (ACES) linear result into a Unity `RenderTexture`.
-    Surface evaluation is isolated behind a `SurfaceData` boundary in the
-    Shade kernel — the exact seam where stage 2 will substitute
-    Unity-compiled Shader Graph material evaluation.
+  - **Wavefront pipeline in phases**: the per-frame pipeline is split into
+    plugin render events — Begin (TLAS rebuild + `RayGen`), then per bounce
+    `Intersect` + `GeomPrep` (attribute interpolation + default URP Lit
+    surface evaluation) and `Shade` (NEE + BSDF sampling), then `Resolve`
+    (progressive accumulation + ACES tonemap into a Unity `RenderTexture`).
+    Hit records, hit attributes, and surface records live in Unity-created
+    `GraphicsBuffer`s shared with the plugin by native pointer, so **Unity
+    compute shaders dispatched between Intersect and Shade can evaluate
+    materials**, overwriting surface records for their material indices.
   - **URP/Lit BSDF**: Lambert diffuse + GGX specular with the URP
-    metallic/smoothness convention (`roughness = (1 - smoothness)^2`,
-    `F0 = lerp(0.04, baseColor, metallic)`), cosine / GGX-NDF importance
-    sampling with lobe selection, and next event estimation for the
-    directional light via shadow rays. Directional light intensity follows
-    Unity's punctual light convention (premultiplied by pi).
+    metallic/smoothness convention, cosine / GGX-NDF importance sampling
+    with lobe selection, and next event estimation for the directional
+    light via shadow rays (intensity premultiplied by pi to match Unity's
+    punctual light convention).
   - **Bindless resources** (Metal 3): mesh buffers are referenced by
     `gpuAddress` and material base maps by `gpuResourceID` from
     plain-buffer-resident tables, with explicit `useResource` residency.
-  - **Render thread integration**: the per-frame TLAS rebuild and the full
-    kernel pipeline are encoded into Unity's current Metal command buffer
-    from a `CommandBuffer.IssuePluginEventAndData` render event
-    (`EndCurrentCommandEncoder` + `CurrentCommandBuffer`), so everything is
-    GPU-ordered with Unity's rendering and the CPU never blocks.
+  - **Render thread integration**: each phase commits Unity's current
+    command buffer (`CommitCurrentCommandBuffer`) and encodes into its own
+    command buffer on Unity's queue, so native kernels and Unity compute
+    dispatches stay GPU-ordered on one command stream with no CPU blocking.
+    (Creating encoders on Unity's own command buffer is not safe here:
+    Unity's compute encoders stay open across plugin events.)
+- `Assets/Editor/ShaderGraphComputeGen.cs` — The Shader Graph to compute
+  shader generator. It obtains the generated shader text through
+  `ShaderGraphImporter.GetShaderText` (internal API via reflection), slices
+  out the `SurfaceDescriptionFunction`, its graph functions, the
+  `UnityPerMaterial` cbuffer, and texture declarations, then wraps them in a
+  compute kernel that maps path tracer hit attributes (UVs, world-space
+  geometry, view direction, time) to `SurfaceDescriptionInputs`. Texture
+  sampling macros are redefined to their LOD variants for compute. Graphs
+  requiring unsupported inputs (screen position, scene color/depth, etc.)
+  are rejected — this is the "conditional" support boundary.
 - `Assets/Scripts/PathTracerTest.cs` — The test harness. It builds a static
-  URP scene at runtime (floor, checker-textured torus, mirror-metal sphere,
-  white torus, emissive sphere — all real "Universal Render Pipeline/Lit"
-  materials), registers meshes/materials/instances with the plugin, and
-  shows the URP raster view (left) and the path traced view (right) side by
-  side. The path traced result is displayed through URP itself (a second
-  camera rendering a fullscreen quad) so both halves share the same color
-  pipeline.
+  URP scene at runtime; the floor uses `Assets/Shaders/TestGraph.shadergraph`
+  (a texture-mapped Lit graph) rasterized by URP on the left and evaluated
+  by its generated compute shader in the path tracer on the right. Material
+  properties are bound to the generated compute generically from the
+  shader's property list. A hand-written SurfaceDescription-style compute
+  (`TestProcedural.compute`) drives the small torus as a second material
+  evaluator. The path traced result is displayed through URP itself (a
+  second camera rendering a fullscreen quad) so both halves share the same
+  color pipeline.
 - `Assets/Scripts/MetalRTPlugin.cs` — P/Invoke interop and the event data
   blob writer (a small ring of unmanaged blobs passes per-frame camera,
   lighting, and instance transforms to the render thread).
@@ -85,16 +100,26 @@ Analytic tests (logged as PASS/FAIL to the console on play):
 - **Probe rays**: 5 world-space rays against the TLAS with analytically
   known hit distances and instance indices.
 - **T1 direct lighting**: with environment off and a single bounce, a floor
-  pixel must equal `albedo/pi * lightColor * cos(theta)`. Measured relative
-  error: **0.00 %**.
+  pixel must equal `albedo/pi * lightColor * cos(theta)` where the albedo is
+  the replicated checker base map sample. Measured relative error:
+  **0.03 %** (native URP Lit evaluation path).
 - **T2 furnace test**: a convex Lambertian sphere (albedo 0.5) in a uniform
   environment must return exactly `rho * E` (zero-variance for a convex
   body). Measured relative error: **0.00 %**.
+- **T3 Unity-compiled material evaluation**: the hand-written
+  SurfaceDescription-style compute shader overrides the floor material and
+  must reproduce the C#-replicated procedural pattern. Measured relative
+  error: **0.00 %** (validates the wavefront interop end to end).
+- **T4 Shader Graph generated material**: the compute shader generated from
+  `TestGraph.shadergraph` evaluates the floor and must match the
+  C#-replicated base map sample times tint — and agree with T1's native
+  evaluation of the same material. Measured relative error: **0.03 %**.
 
 Visual verification: matching composition and shadow directions against the
-URP raster reference, plus path-tracing-only effects (emissive light bleed,
-GI color bleeding, physically correct mirror reflections), with matching
-overall brightness (floor pixel values agree within ~1 %).
+URP raster reference, the Shader Graph floor matching between the raster
+(graph shader) and path traced (generated compute) views, plus
+path-tracing-only effects (emissive light bleed, GI color bleeding,
+physically correct mirror reflections).
 
 ## How to run
 
@@ -109,9 +134,8 @@ after rebuilding the plugin.
 
 ## Roadmap
 
-- **Stage 2 — conditional Shader Graph support**: replace the `SurfaceData`
-  evaluation with per-material compute shaders generated from Shader Graph's
-  `SurfaceDescription` functions and compiled by Unity for Metal
-  (wavefront-style deferred material evaluation).
-- **URP plumbing**: drive the render event from a `ScriptableRenderPass`
+- **URP plumbing**: drive the render events from a `ScriptableRenderPass`
   (RenderGraph) and consume URP cameras and render targets directly.
+- **Robustness**: broaden the supported Shader Graph input set (multiple
+  UV channels, vertex color), automate generation on graph import, handle
+  alpha clipping (non-opaque intersection), and support keyword variants.

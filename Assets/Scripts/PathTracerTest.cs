@@ -53,6 +53,17 @@ public sealed class PathTracerTest : MonoBehaviour
 
     // Private members
 
+    // A material evaluated by a Unity-compiled compute shader instead of
+    // the native default URP Lit evaluation (the Shader Graph path).
+    sealed class MaterialCompute
+    {
+        public ComputeShader Shader;
+        public int Kernel;
+        public int MaterialIndex;
+        public bool Enabled = true;
+        public Action<CommandBuffer> Bind;
+    }
+
     Camera _camera;
     Light _light;
     (int mesh, int material, Transform transform)[] _instances;
@@ -60,6 +71,10 @@ public sealed class PathTracerTest : MonoBehaviour
     Material[] _materials;
     RenderTexture _result;
     IntPtr _resultPtr;
+    GraphicsBuffer _hitBuffer, _attrBuffer, _surfBuffer;
+    readonly System.Collections.Generic.List<MaterialCompute>
+      _materialComputes = new();
+    MaterialCompute _procedural;
     CommandBuffer _traceCommands;
     IntPtr _eventFunc;
     IntPtr[] _eventData;
@@ -69,6 +84,12 @@ public sealed class PathTracerTest : MonoBehaviour
     bool _resetQueued = true;
     TraceParams? _cameraOverride;
     FrameSettings _settings;
+
+    // Procedural test material parameters (linear colors)
+    static readonly Color ProcColorA = new Color(0.9f, 0.25f, 0.1f);
+    static readonly Color ProcColorB = new Color(0.1f, 0.3f, 0.9f);
+    const float ProcCheckerScale = 6;
+    const int ProceduralTargetMaterial = 3; // white torus
 
     const int EventRingSize = 4;
 
@@ -104,6 +125,9 @@ public sealed class PathTracerTest : MonoBehaviour
     {
         MetalRT_Dispose();
         _traceCommands?.Dispose();
+        _hitBuffer?.Dispose();
+        _attrBuffer?.Dispose();
+        _surfBuffer?.Dispose();
         if (_eventData != null)
             foreach (var ptr in _eventData) Marshal.FreeHGlobal(ptr);
     }
@@ -158,7 +182,10 @@ public sealed class PathTracerTest : MonoBehaviour
         var sphere = LoadAndRegisterMesh("Sphere");
         if (plane < 0 || torus < 0 || sphere < 0) return false;
 
-        var floorMat = MakeLitMaterial(new Color(0.5f, 0.5f, 0.5f), 0, 0.2f);
+        // The floor uses the test Shader Graph: URP rasterizes it with the
+        // graph's own shader while the path tracer evaluates the compute
+        // shader generated from the same graph, so both views must match.
+        var floorMat = MakeShaderGraphMaterial();
         var torusMat = MakeLitMaterial(new Color(0.8f, 0.15f, 0.1f), 0, 0.3f);
         torusMat.SetTexture("_BaseMap", MakeCheckerTexture());
         var metalMat = MakeLitMaterial(new Color(0.95f, 0.93f, 0.9f), 1, 0.9f);
@@ -226,6 +253,21 @@ public sealed class PathTracerTest : MonoBehaviour
         exposure = 1
     };
 
+    Material MakeShaderGraphMaterial()
+    {
+        var mat = new Material(Shader.Find("Lit/TestGraph"));
+        mat.SetColor("_BaseColor", Color.white);
+        mat.SetFloat("_Smoothness", 0.3f);
+        mat.SetTexture("_BaseMap", MakeCheckerTexture());
+
+        // Non-metallic, full-gloss-scale MOS map (R: metallic 0, A: 1)
+        var mos = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+        mos.SetPixel(0, 0, new Color(0, 0, 0, 1));
+        mos.Apply(false, true);
+        mat.SetTexture("_MetallicGlossMap", mos);
+        return mat;
+    }
+
     static Material MakeLitMaterial(Color color, float metallic, float smoothness)
     {
         var mat = new Material(Shader.Find("Universal Render Pipeline/Lit"));
@@ -285,10 +327,12 @@ public sealed class PathTracerTest : MonoBehaviour
             return -1;
         }
 
-        // Normal and UV must live in the same vertex stream as position for
-        // the single-buffer fetch in the shader.
+        // Normal/tangent/UV must live in the same vertex stream as position
+        // for the single-buffer fetch in the shader.
         var normalOffset = AttributeOffset(mesh, VertexAttribute.Normal,
                                            posStream, 3);
+        var tangentOffset = AttributeOffset(mesh, VertexAttribute.Tangent,
+                                            posStream, 4);
         var uvOffset = AttributeOffset(mesh, VertexAttribute.TexCoord0,
                                        posStream, 2);
 
@@ -301,7 +345,7 @@ public sealed class PathTracerTest : MonoBehaviour
         // frame, so the BLAS is built right away (synchronously).
         var ret = MetalRT_AddMesh
           (mesh.GetNativeVertexBufferPtr(posStream), (uint)stride,
-           (uint)posOffset, normalOffset, uvOffset,
+           (uint)posOffset, normalOffset, tangentOffset, uvOffset,
            mesh.GetNativeIndexBufferPtr(),
            is16Bit ? 0u : 1u, indexStart * indexSize, indexCount / 3);
 
@@ -338,17 +382,26 @@ public sealed class PathTracerTest : MonoBehaviour
         var descs = new MaterialDesc[_materials.Length];
         for (var i = 0; i < _materials.Length; i++)
         {
+            // Materials with non-Lit shaders (Shader Graph) may lack some
+            // of these properties; their surface records get overwritten by
+            // their material evaluation compute shaders anyway.
             var mat = _materials[i];
-            var tex = mat.GetTexture("_BaseMap") as Texture2D;
-            var emission = mat.IsKeywordEnabled("_EMISSION") ?
+            var tex = mat.HasProperty("_BaseMap") ?
+              mat.GetTexture("_BaseMap") as Texture2D : null;
+            var emission = mat.IsKeywordEnabled("_EMISSION") &&
+                           mat.HasProperty("_EmissionColor") ?
               mat.GetColor("_EmissionColor") : Color.black;
             descs[i] = new MaterialDesc
             {
-                baseColor = mat.GetColor("_BaseColor").linear,
+                baseColor = mat.HasProperty("_BaseColor") ?
+                  mat.GetColor("_BaseColor").linear : Color.white,
                 emission = emission, // HDR colors are already linear
-                baseMapST = mat.GetVector("_BaseMap_ST"),
-                metallic = mat.GetFloat("_Metallic"),
-                smoothness = mat.GetFloat("_Smoothness"),
+                baseMapST = mat.HasProperty("_BaseMap_ST") ?
+                  mat.GetVector("_BaseMap_ST") : new Vector4(1, 1, 0, 0),
+                metallic = mat.HasProperty("_Metallic") ?
+                  mat.GetFloat("_Metallic") : 0,
+                smoothness = mat.HasProperty("_Smoothness") ?
+                  mat.GetFloat("_Smoothness") : 0.5f,
                 hasBaseMap = tex != null ? 1u : 0u,
                 texture = tex != null ?
                   tex.GetNativeTexturePtr().ToInt64() : 0
@@ -462,6 +515,20 @@ public sealed class PathTracerTest : MonoBehaviour
         _resultPtr = _result.GetNativeTexturePtr();
         Log($"RenderTexture ({w}x{h}, ARGBFloat) created; native ptr acquired");
 
+        // Wavefront buffers shared between the native kernels and Unity
+        // compute shaders (material evaluation).
+        _hitBuffer = new GraphicsBuffer
+          (GraphicsBuffer.Target.Structured, w * h, HitRecordStride);
+        _attrBuffer = new GraphicsBuffer
+          (GraphicsBuffer.Target.Structured, w * h, HitAttributesStride);
+        _surfBuffer = new GraphicsBuffer
+          (GraphicsBuffer.Target.Structured, w * h, SurfaceRecordStride);
+        var ret = MetalRT_SetSharedBuffers(_hitBuffer.GetNativeBufferPtr(),
+                                           _attrBuffer.GetNativeBufferPtr(),
+                                           _surfBuffer.GetNativeBufferPtr());
+        Log($"Shared wavefront buffers registered (ret={ret}): " +
+            (ret == 0 ? "OK" : $"FAIL: {LastError}"));
+
         _eventFunc = MetalRT_GetRenderEventFunc();
         _traceCommands = new CommandBuffer { name = "MetalRT Trace" };
 
@@ -470,7 +537,122 @@ public sealed class PathTracerTest : MonoBehaviour
         _eventData = new IntPtr[EventRingSize];
         for (var i = 0; i < EventRingSize; i++)
             _eventData[i] = Marshal.AllocHGlobal(EventDataSize);
+
+        SetUpProceduralMaterial();
     }
+
+    // Registers the hand-written SurfaceDescription-style compute shader as
+    // the material evaluator for the white torus (stage 2a validation).
+    void SetUpProceduralMaterial()
+    {
+        var cs = Resources.Load<ComputeShader>("TestProcedural");
+        _procedural = new MaterialCompute
+        {
+            Shader = cs,
+            Kernel = cs.FindKernel("EvaluateMaterial"),
+            MaterialIndex = ProceduralTargetMaterial,
+            Bind = cb =>
+            {
+                cb.SetComputeVectorParam(cs, "_ColorA", ProcColorA);
+                cb.SetComputeVectorParam(cs, "_ColorB", ProcColorB);
+                cb.SetComputeFloatParam(cs, "_CheckerScale", ProcCheckerScale);
+            }
+        };
+        _materialComputes.Add(_procedural);
+        Log("Procedural material compute registered " +
+            $"(material {ProceduralTargetMaterial}, Unity-compiled kernel)");
+
+        // The Shader Graph generated compute drives the floor material.
+        var sgCompute = Resources.Load<ComputeShader>("TestGraphGen");
+        if (sgCompute == null)
+        {
+            Log("FAIL: TestGraphGen.compute not found " +
+                "(run MetalRT/Generate Compute From Test Graph)");
+            return;
+        }
+        _materialComputes.Add
+          (MakeShaderGraphCompute(sgCompute, _materials[0], 0));
+        Log("Shader Graph material compute registered (material 0, " +
+            "generated from TestGraph.shadergraph)");
+    }
+
+    // Wraps a generated Shader Graph compute shader with a binder that
+    // feeds it the source material's properties (resolved generically from
+    // the shader's property list).
+    MaterialCompute MakeShaderGraphCompute(ComputeShader cs, Material mat,
+                                           int materialIndex)
+    {
+        var kernel = cs.FindKernel("EvaluateMaterial");
+        var shader = mat.shader;
+        var floats = new System.Collections.Generic.List<string>();
+        var colors = new System.Collections.Generic.List<(string, bool)>();
+        var vectors = new System.Collections.Generic.List<string>();
+        var textures = new System.Collections.Generic.List<(string, string)>();
+
+        for (var i = 0; i < shader.GetPropertyCount(); i++)
+        {
+            var name = shader.GetPropertyName(i);
+            var flags = shader.GetPropertyFlags(i);
+            switch (shader.GetPropertyType(i))
+            {
+                case ShaderPropertyType.Float:
+                case ShaderPropertyType.Range:
+                    floats.Add(name);
+                    break;
+                case ShaderPropertyType.Color:
+                    colors.Add((name, flags.HasFlag(ShaderPropertyFlags.HDR)));
+                    break;
+                case ShaderPropertyType.Vector:
+                    vectors.Add(name);
+                    break;
+                case ShaderPropertyType.Texture:
+                    textures.Add((name,
+                                  shader.GetPropertyTextureDefaultName(i)));
+                    break;
+            }
+        }
+
+        return new MaterialCompute
+        {
+            Shader = cs,
+            Kernel = kernel,
+            MaterialIndex = materialIndex,
+            Bind = cb =>
+            {
+                foreach (var n in floats)
+                    cb.SetComputeFloatParam(cs, n, mat.GetFloat(n));
+                foreach (var (n, hdr) in colors)
+                    cb.SetComputeVectorParam
+                      (cs, n, hdr ? mat.GetColor(n) : mat.GetColor(n).linear);
+                foreach (var n in vectors)
+                    cb.SetComputeVectorParam(cs, n, mat.GetVector(n));
+                foreach (var (n, def) in textures)
+                {
+                    var t = mat.GetTexture(n) ?? DefaultTexture(def);
+                    cb.SetComputeTextureParam(cs, kernel, n, t);
+                    cb.SetComputeVectorParam
+                      (cs, n + "_TexelSize",
+                       new Vector4(1f / t.width, 1f / t.height,
+                                   t.width, t.height));
+                    if (mat.HasProperty(n + "_ST"))
+                        cb.SetComputeVectorParam
+                          (cs, n + "_ST", mat.GetVector(n + "_ST"));
+                }
+                cb.SetComputeVectorParam
+                  (cs, "_TimeParams",
+                   new Vector4(Time.time, Mathf.Sin(Time.time),
+                               Mathf.Cos(Time.time), 0));
+            }
+        };
+    }
+
+    static Texture DefaultTexture(string name) => name switch
+    {
+        "black" => Texture2D.blackTexture,
+        "bump" => Texture2D.normalTexture,
+        "gray" or "grey" => Texture2D.grayTexture,
+        _ => Texture2D.whiteTexture
+    };
 
     TraceParams CameraParams()
     {
@@ -496,12 +678,39 @@ public sealed class PathTracerTest : MonoBehaviour
         _resetQueued = false;
 
         _eventSlot = (_eventSlot + 1) % EventRingSize;
-        WriteEventData(_eventData[_eventSlot], p, _resultPtr, _frameIndex++,
+        var blob = _eventData[_eventSlot];
+        WriteEventData(blob, p, _resultPtr, _frameIndex++,
                        s, MakeInstanceDescs());
 
+        // Phased pipeline: native events with Unity material evaluation
+        // dispatches interleaved between Intersect and Shade of each bounce.
+        var (w, h) = (_result.width, _result.height);
+        var (gx, gy) = ((w + 7) / 8, (h + 7) / 8);
+
         _traceCommands.Clear();
-        _traceCommands.IssuePluginEventAndData
-          (_eventFunc, 0, _eventData[_eventSlot]);
+        _traceCommands.IssuePluginEventAndData(_eventFunc, PhaseBegin, blob);
+        for (var b = 0; b < s.maxBounces; b++)
+        {
+            _traceCommands.IssuePluginEventAndData
+              (_eventFunc, PhaseIntersect | b << 8, blob);
+            foreach (var mc in _materialComputes)
+            {
+                if (!mc.Enabled) continue;
+                _traceCommands.SetComputeBufferParam
+                  (mc.Shader, mc.Kernel, "_Attributes", _attrBuffer);
+                _traceCommands.SetComputeBufferParam
+                  (mc.Shader, mc.Kernel, "_Surfaces", _surfBuffer);
+                _traceCommands.SetComputeIntParam(mc.Shader, "_Width", w);
+                _traceCommands.SetComputeIntParam(mc.Shader, "_Height", h);
+                _traceCommands.SetComputeIntParam
+                  (mc.Shader, "_MaterialIndex", mc.MaterialIndex);
+                mc.Bind?.Invoke(_traceCommands);
+                _traceCommands.DispatchCompute(mc.Shader, mc.Kernel, gx, gy, 1);
+            }
+            _traceCommands.IssuePluginEventAndData
+              (_eventFunc, PhaseShade | b << 8, blob);
+        }
+        _traceCommands.IssuePluginEventAndData(_eventFunc, PhaseResolve, blob);
         Graphics.ExecuteCommandBuffer(_traceCommands);
         _tracedFrames++;
     }
@@ -511,9 +720,29 @@ public sealed class PathTracerTest : MonoBehaviour
 
     IEnumerator RunTestSequence()
     {
-        // T1: direct lighting on the floor. env off, single bounce,
-        // diffuse-only BSDF, linear output.
+        // The floor's material evaluation compute (Shader Graph) is toggled
+        // per test phase; when disabled the native Lit path evaluates the
+        // floor from the material table (same base map and tint).
+        var sgCompute = _materialComputes.Count > 1 ?
+          _materialComputes[^1] : null;
+
+        // Expected linear floor albedo at a world point: checker base map
+        // sample times the base color tint (cell interiors only, so LOD
+        // differences between the native and graph paths don't matter).
+        Color FloorAlbedo(Vector3 p)
+        {
+            var uv = new Vector2((5 - p.x) / 10, (p.z + 5) / 10);
+            var cell = uv * 8; // checker texture cells
+            var odd = (Mathf.FloorToInt(cell.x) + Mathf.FloorToInt(cell.y))
+                      % 2 == 1;
+            var texel = Mathf.GammaToLinearSpace((odd ? 230 : 100) / 255f);
+            return texel * _materials[0].GetColor("_BaseColor").linear;
+        }
+
+        // T1: direct lighting on the floor through the native URP Lit
+        // evaluation. env off, single bounce, diffuse-only BSDF.
         var t1Point = new Vector3(1.5f, 0, -1.8f);
+        if (sgCompute != null) sgCompute.Enabled = false;
         _settings = ProductionSettings();
         _settings.envColor = Color.black;
         _settings.maxBounces = 1;
@@ -524,7 +753,7 @@ public sealed class PathTracerTest : MonoBehaviour
         for (var i = 0; i < TestFrames; i++) yield return null;
 
         {
-            var albedo = _materials[0].GetColor("_BaseColor").linear;
+            var albedo = FloorAlbedo(t1Point);
             var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
             var expected = (Color)(albedo * _settings.lightColor) *
                            (cos / Mathf.PI);
@@ -553,6 +782,66 @@ public sealed class PathTracerTest : MonoBehaviour
             var center = new Vector2Int(_result.width / 2, _result.height / 2);
             var measured = ReadResultAverage(center, 2);
             CheckClose("T2 furnace (rho=0.5 sphere)", measured, expected, 0.02f);
+        }
+
+        // T3: Unity-compiled material evaluation in the loop. Same setup as
+        // T1, but the procedural compute shader overrides the floor
+        // material, so the measured pixel must match the C#-replicated
+        // procedural pattern (validates the wavefront interop end to end).
+        _procedural.MaterialIndex = 0; // floor (sg compute stays disabled)
+        _settings = ProductionSettings();
+        _settings.envColor = Color.black;
+        _settings.maxBounces = 1;
+        _settings.linearOutput = true;
+        _settings.debugFlags = 1; // diffuse only
+        _cameraOverride = null;
+        _resetQueued = true;
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            // Replicate the procedural pattern (Plane.obj UV mapping with
+            // the importer's x flip).
+            var uv = new Vector2((5 - t1Point.x) / 10, (t1Point.z + 5) / 10);
+            var cell = uv * ProcCheckerScale;
+            var checker = Mathf.Abs(Mathf.Floor(cell.x) + Mathf.Floor(cell.y))
+                          % 2;
+            var albedo = Color.Lerp(ProcColorA, ProcColorB, checker);
+            var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
+            var expected = (Color)(albedo * _settings.lightColor) *
+                           (cos / Mathf.PI);
+            var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
+            CheckClose("T3 Unity-compiled material (floor)", measured,
+                       expected, 0.03f);
+        }
+
+        _procedural.MaterialIndex = ProceduralTargetMaterial;
+        if (sgCompute != null) sgCompute.Enabled = true;
+
+        // T4: Shader Graph generated compute on the floor. The graph
+        // multiplies the checker base map by _BaseColor, so the measured
+        // pixel must match the C#-replicated texture sample. This validates
+        // the automated graph extraction end to end.
+        if (sgCompute != null)
+        {
+            _settings = ProductionSettings();
+            _settings.envColor = Color.black;
+            _settings.maxBounces = 1;
+            _settings.linearOutput = true;
+            _settings.debugFlags = 1; // diffuse only
+            _resetQueued = true;
+
+            for (var i = 0; i < TestFrames; i++) yield return null;
+
+            {
+                var albedo = FloorAlbedo(t1Point);
+                var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
+                var expected = (Color)(albedo * _settings.lightColor) *
+                               (cos / Mathf.PI);
+                var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
+                CheckClose("T4 Shader Graph generated material (floor)",
+                           measured, expected, 0.03f);
+            }
         }
 
         // Production: progressive path tracing of the visible scene.

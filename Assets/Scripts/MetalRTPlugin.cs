@@ -63,6 +63,19 @@ public static class MetalRTPlugin
 
     public const uint NoAttribute = 0xffffffffu;
 
+    // Render event phases (eventId = phase | bounce << 8); must match
+    // EventPhase in MetalRTPlugin.mm.
+    public const int PhaseBegin = 0;
+    public const int PhaseIntersect = 1;
+    public const int PhaseShade = 2;
+    public const int PhaseResolve = 3;
+
+    // Shared buffer strides; must match the structs in MetalRTPlugin.mm and
+    // TestProcedural.compute.
+    public const int HitRecordStride = 32;
+    public const int HitAttributesStride = 96;
+    public const int SurfaceRecordStride = 64;
+
     // Native entry points
 
     const string PluginName = "MetalRTTest";
@@ -72,9 +85,11 @@ public static class MetalRTPlugin
       MetalRT_DeviceSupportsRaytracing();
     [DllImport(PluginName)] public static extern int MetalRT_AddMesh
       (IntPtr vertexBuffer, uint vertexStride, uint positionOffset,
-       uint normalOffset, uint uvOffset,
+       uint normalOffset, uint tangentOffset, uint uvOffset,
        IntPtr indexBuffer, uint indexFormat, uint indexByteOffset,
        uint triangleCount);
+    [DllImport(PluginName)] public static extern int MetalRT_SetSharedBuffers
+      (IntPtr hits, IntPtr attributes, IntPtr surfaces);
     [DllImport(PluginName)] public static extern int MetalRT_SetMaterials
       (MaterialDesc[] materials, int count);
     [DllImport(PluginName)] public static extern int MetalRT_BuildInstanceAS

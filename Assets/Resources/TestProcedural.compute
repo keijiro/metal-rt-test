@@ -1,0 +1,89 @@
+// Hand-written material evaluation compute shader that mimics the shape of
+// Shader Graph generated code (SurfaceDescriptionInputs -> SurfaceDescription)
+// to validate the wavefront material evaluation path before automated
+// Shader Graph extraction. Overwrites the surface records of hits whose
+// material index matches _MaterialIndex.
+
+#pragma kernel EvaluateMaterial
+
+// Shared with the native plugin; must match HitAttributes / SurfaceRecord
+// in MetalRTPlugin.mm.
+struct HitAttributes
+{
+    float4 position; // xyz: world position
+    float4 normal;   // xyz: world shading normal
+    float4 tangent;  // xyz: world tangent, w: bitangent sign
+    float4 uvView;   // xy: uv0
+    float4 viewDir;  // xyz: direction toward the ray origin
+    uint4 meta;      // x: material index, y: hit flag
+};
+
+struct SurfaceRecord
+{
+    float4 baseColor; // rgb: linear albedo
+    float4 normal;    // xyz: world shading normal
+    float4 emission;  // rgb: linear radiance
+    float4 params;    // x: metallic, y: smoothness
+};
+
+StructuredBuffer<HitAttributes> _Attributes;
+RWStructuredBuffer<SurfaceRecord> _Surfaces;
+
+uint _Width, _Height, _MaterialIndex;
+float4 _ColorA, _ColorB;
+float _CheckerScale;
+
+// --- SurfaceDescription section (Shader Graph generated code shape) ---
+
+struct SurfaceDescriptionInputs
+{
+    float2 uv0;
+    float3 WorldSpacePosition;
+};
+
+struct SurfaceDescription
+{
+    float3 BaseColor;
+    float3 Emission;
+    float Metallic;
+    float Smoothness;
+};
+
+SurfaceDescription SurfaceDescriptionFunction(SurfaceDescriptionInputs IN)
+{
+    float2 cell = floor(IN.uv0 * _CheckerScale);
+    float checker = fmod(abs(cell.x + cell.y), 2);
+    float stripe = step(0.5, frac(IN.WorldSpacePosition.y * 4));
+
+    SurfaceDescription surface;
+    surface.BaseColor = lerp(_ColorA.rgb, _ColorB.rgb, checker);
+    surface.Emission = 0;
+    surface.Metallic = 0;
+    surface.Smoothness = lerp(0.2, 0.6, stripe);
+    return surface;
+}
+
+// --- Adapter: hit attributes -> inputs, description -> surface record ---
+
+[numthreads(8, 8, 1)]
+void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    uint idx = id.y * _Width + id.x;
+
+    HitAttributes attr = _Attributes[idx];
+    if (attr.meta.y == 0 || attr.meta.x != _MaterialIndex) return;
+
+    SurfaceDescriptionInputs IN;
+    IN.uv0 = attr.uvView.xy;
+    IN.WorldSpacePosition = attr.position.xyz;
+
+    SurfaceDescription d = SurfaceDescriptionFunction(IN);
+
+    SurfaceRecord surf;
+    surf.baseColor = float4(d.BaseColor, 1);
+    surf.normal = attr.normal;
+    surf.emission = float4(d.Emission, 0);
+    surf.params = float4(d.Metallic, d.Smoothness, 0, 0);
+    _Surfaces[idx] = surf;
+}

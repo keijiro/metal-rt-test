@@ -41,8 +41,8 @@ public sealed class MetalRayTracingTest : MonoBehaviour
       (IntPtr vertexBuffer, uint vertexStride, uint positionOffset,
        IntPtr indexBuffer, uint indexFormat, uint indexByteOffset,
        uint triangleCount);
-    [DllImport(PluginName)] static extern int MetalRT_TraceImage
-      (in TraceParams traceParams, byte[] pixels);
+    [DllImport(PluginName)] static extern int MetalRT_TraceToTexture
+      (in TraceParams traceParams, IntPtr texture);
     [DllImport(PluginName)] static extern int MetalRT_TraceProbes
       (in TraceParams traceParams, Vector4[] rays, int count,
        [Out] ProbeResult[] results);
@@ -76,8 +76,12 @@ public sealed class MetalRayTracingTest : MonoBehaviour
     Camera _camera;
     Transform _target;
     Mesh _mesh;
-    Texture2D _result;
+    RenderTexture _result;
+    IntPtr _resultPtr;
     TraceParams _params;
+    bool _traceFailed;
+    bool _traceLogged;
+    int _tracedFrames;
 
     static void Log(string message) => Debug.Log("[MetalRT] " + message);
 
@@ -95,7 +99,20 @@ public sealed class MetalRayTracingTest : MonoBehaviour
         SetUpScene();
         if (!BuildAccelerationStructure()) return;
         RunProbeTest();
-        RunImageTest();
+        SetUpRenderTarget();
+    }
+
+    void Update()
+    {
+        if (_result == null || _traceFailed) return;
+
+        // Rotate the target so the per-frame trace visibly stays in sync
+        // with the rasterized reference.
+        _target.Rotate(0, 20 * Time.deltaTime, 0, Space.World);
+
+        TraceFrame();
+
+        if (++_tracedFrames == 10) SaveResultImage();
     }
 
     void OnDestroy() => MetalRT_Dispose();
@@ -237,15 +254,24 @@ public sealed class MetalRayTracingTest : MonoBehaviour
             (passed == Probes.Length ? " -- ALL PASS" : " -- FAILURE"));
     }
 
-    // Visual test: full frame trace with the scene camera
+    // Visual test: per-frame full trace written directly into a RenderTexture
 
-    void RunImageTest()
+    void SetUpRenderTarget()
     {
         var (w, h) = (_camera.pixelWidth, _camera.pixelHeight);
+        _result = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32)
+          { enableRandomWrite = true };
+        _result.Create();
+        _resultPtr = _result.GetNativeTexturePtr();
+        Log($"RenderTexture ({w}x{h}) created; native ptr acquired");
+    }
 
+    void TraceFrame()
+    {
         var w2l = _target.worldToLocalMatrix;
         var ct = _camera.transform;
         var tanFov = Mathf.Tan(_camera.fieldOfView * Mathf.Deg2Rad / 2);
+        var (w, h) = (_result.width, _result.height);
 
         var p = _params;
         p.originTan = V4(w2l.MultiplyPoint(ct.position), tanFov);
@@ -254,22 +280,38 @@ public sealed class MetalRayTracingTest : MonoBehaviour
         p.forward = V4(w2l.MultiplyVector(ct.forward), 0);
         (p.width, p.height) = ((uint)w, (uint)h);
 
-        var pixels = new byte[w * h * 4];
-        var ret = MetalRT_TraceImage(p, pixels);
+        var ret = MetalRT_TraceToTexture(p, _resultPtr);
         if (ret != 0)
         {
-            Log($"FAIL: Image trace error {ret}: {LastError}");
+            _traceFailed = true;
+            Log($"FAIL: Texture trace error {ret}: {LastError}");
             return;
         }
 
-        _result = new Texture2D(w, h, TextureFormat.RGBA32, false);
-        _result.LoadRawTextureData(pixels);
-        _result.Apply();
+        if (!_traceLogged)
+        {
+            _traceLogged = true;
+            Log("Direct RenderTexture write: OK (tracing every frame)");
+        }
+    }
+
+    // Reads the natively written RenderTexture back on the Unity side, which
+    // also verifies the texture contents are visible to Unity.
+    void SaveResultImage()
+    {
+        var (w, h) = (_result.width, _result.height);
+        var prev = RenderTexture.active;
+        RenderTexture.active = _result;
+        var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+        tex.Apply();
+        RenderTexture.active = prev;
 
         var path = Path.GetFullPath
           (Path.Combine(Application.dataPath, "..", "Output", "rt-result.png"));
         Directory.CreateDirectory(Path.GetDirectoryName(path));
-        File.WriteAllBytes(path, _result.EncodeToPNG());
+        File.WriteAllBytes(path, tex.EncodeToPNG());
+        Destroy(tex);
         Log($"Ray traced image ({w}x{h}) written to {path}");
     }
 

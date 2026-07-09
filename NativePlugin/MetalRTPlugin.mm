@@ -22,6 +22,7 @@ IUnityGraphicsMetalV1* s_Metal;
 id<MTLDevice> s_Device;
 id<MTLCommandQueue> s_Queue;
 id<MTLComputePipelineState> s_ImagePipeline;
+id<MTLComputePipelineState> s_TexturePipeline;
 id<MTLComputePipelineState> s_ProbePipeline;
 
 id<MTLAccelerationStructure> s_Accel;
@@ -111,6 +112,30 @@ static float3 LoadPosition
     return *p;
 }
 
+static float3 TraceColor
+  (primitive_acceleration_structure accel,
+   constant TraceParams& params,
+   device const uchar* vertices,
+   device const uchar* indices,
+   float2 ndc)
+{
+    ray r = GenerateRay(params, ndc);
+
+    intersector<triangle_data> isect;
+    intersection_result<triangle_data> hit = isect.intersect(r, accel);
+
+    if (hit.type != intersection_type::triangle)
+        return float3(0.1, 0.1, 0.2); // background
+
+    uint3 tri = LoadTriangleIndices(params, indices, hit.primitive_id);
+    float3 p0 = LoadPosition(params, vertices, tri.x);
+    float3 p1 = LoadPosition(params, vertices, tri.y);
+    float3 p2 = LoadPosition(params, vertices, tri.z);
+    float3 n = normalize(cross(p1 - p0, p2 - p0));
+    if (dot(n, r.direction) > 0) n = -n; // face the ray origin
+    return n * 0.5 + 0.5;
+}
+
 kernel void TraceImage
   (primitive_acceleration_structure accel [[buffer(0)]],
    constant TraceParams& params [[buffer(1)]],
@@ -122,26 +147,27 @@ kernel void TraceImage
     if (id.x >= params.width || id.y >= params.height) return;
 
     float2 ndc = float2(id) / float2(params.width, params.height) * 2 - 1;
-    ray r = GenerateRay(params, ndc);
-
-    intersector<triangle_data> isect;
-    intersection_result<triangle_data> hit = isect.intersect(r, accel);
-
-    float3 color = float3(0.1, 0.1, 0.2); // background
-
-    if (hit.type == intersection_type::triangle)
-    {
-        uint3 tri = LoadTriangleIndices(params, indices, hit.primitive_id);
-        float3 p0 = LoadPosition(params, vertices, tri.x);
-        float3 p1 = LoadPosition(params, vertices, tri.y);
-        float3 p2 = LoadPosition(params, vertices, tri.z);
-        float3 n = normalize(cross(p1 - p0, p2 - p0));
-        if (dot(n, r.direction) > 0) n = -n; // face the ray origin
-        color = n * 0.5 + 0.5;
-    }
-
+    float3 color = TraceColor(accel, params, vertices, indices, ndc);
     output[id.y * params.width + id.x] =
       uchar4(uchar3(saturate(color) * 255), 255);
+}
+
+// Writes into a Unity RenderTexture. GUI.DrawTexture and ReadPixels both
+// treat row 0 as the bottom of the image (same convention as Texture2D), so
+// no vertical flip is applied here.
+kernel void TraceImageTexture
+  (primitive_acceleration_structure accel [[buffer(0)]],
+   constant TraceParams& params [[buffer(1)]],
+   texture2d<float, access::write> output [[texture(0)]],
+   device const uchar* vertices [[buffer(3)]],
+   device const uchar* indices [[buffer(4)]],
+   uint2 id [[thread_position_in_grid]])
+{
+    if (id.x >= params.width || id.y >= params.height) return;
+
+    float2 ndc = float2(id) / float2(params.width, params.height) * 2 - 1;
+    float3 color = TraceColor(accel, params, vertices, indices, ndc);
+    output.write(float4(saturate(color), 1), id);
 }
 
 // Probe rays are given explicitly in object space as (origin, direction)
@@ -223,7 +249,8 @@ id<MTLComputePipelineState> CreatePipeline(id<MTLLibrary> library,
 
 bool EnsurePipelines()
 {
-    if (s_ImagePipeline != nil && s_ProbePipeline != nil) return true;
+    if (s_ImagePipeline != nil && s_TexturePipeline != nil &&
+        s_ProbePipeline != nil) return true;
 
     NSError* error = nil;
     id<MTLLibrary> library =
@@ -238,8 +265,10 @@ bool EnsurePipelines()
     }
 
     s_ImagePipeline = CreatePipeline(library, @"TraceImage");
+    s_TexturePipeline = CreatePipeline(library, @"TraceImageTexture");
     s_ProbePipeline = CreatePipeline(library, @"TraceProbes");
-    return s_ImagePipeline != nil && s_ProbePipeline != nil;
+    return s_ImagePipeline != nil && s_TexturePipeline != nil &&
+           s_ProbePipeline != nil;
 }
 
 bool RunCommandBuffer(id<MTLCommandBuffer> command)
@@ -389,6 +418,38 @@ MetalRT_TraceImage(const TraceParams* params, void* outputPixels)
 
     std::memcpy(outputPixels, output.contents, size);
     return 0;
+}
+
+// Writes directly into a Unity RenderTexture (created with
+// enableRandomWrite) given its GetNativeTexturePtr. The dispatch completes
+// synchronously, so Unity can sample the texture afterwards without any
+// extra synchronization.
+int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
+MetalRT_TraceToTexture(const TraceParams* params, void* texturePtr)
+{
+    if (s_Accel == nil)
+    {
+        SetError(@"Acceleration structure has not been built.");
+        return -1;
+    }
+    if (!EnsurePipelines()) return -2;
+
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)texturePtr;
+    if (texture == nil || !(texture.usage & MTLTextureUsageShaderWrite))
+    {
+        SetError(@"Target texture is nil or lacks shader write usage.");
+        return -3;
+    }
+
+    bool ok = DispatchTrace(
+      s_TexturePipeline, params, nil,
+      ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setTexture:texture atIndex:0];
+          [encoder setBuffer:s_VertexBuffer offset:0 atIndex:3];
+          [encoder setBuffer:s_IndexBuffer offset:0 atIndex:4];
+      },
+      MTLSizeMake(params->width, params->height, 1), MTLSizeMake(8, 8, 1));
+    return ok ? 0 : -4;
 }
 
 // rays: (origin.xyzw, direction.xyzw) float4 pairs in object space

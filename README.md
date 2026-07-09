@@ -46,11 +46,16 @@ project.
     plugin — no CPU-side mesh data is ever touched.
   - Runs probe rays with analytically derived expectations for the torus
     (hit distances, misses through the hole) and logs PASS/FAIL.
-  - Traces a full frame from the scene camera and shows it next to a
-    rasterized reference: left half is a normal `MeshRenderer` drawing
-    object-space normals, right half is the ray traced result colored by
-    geometric normals. Matching silhouettes and colors confirm correct
-    intersections. The image is also saved to `Output/rt-result.png`.
+  - Traces a full frame from the scene camera every frame, written by the
+    native plugin directly into a Unity `RenderTexture` (created with
+    `enableRandomWrite` and passed as `GetNativeTexturePtr`), and shows it
+    next to a rasterized reference: left half is a normal `MeshRenderer`
+    drawing object-space normals, right half is the ray traced result colored
+    by geometric normals. The target mesh rotates so the two views can be
+    seen staying in sync. Matching silhouettes and colors confirm correct
+    intersections. The texture is also read back with `ReadPixels` and saved
+    to `Output/rt-result.png`, verifying that natively written contents are
+    visible to Unity.
 - `Assets/Resources/Torus.obj` — Generated test mesh (major radius 1.0, minor
   radius 0.4, 4096 triangles).
 
@@ -68,6 +73,11 @@ Verified on Unity 6000.3.19f1 / macOS / Apple M4 Max:
   within 0.02.
 - Visual test: the ray traced image matches the rasterized reference in
   silhouette and normal color distribution (see `Images/comparison.png`).
+- Direct `RenderTexture` write: **OK** — the native plugin writes the trace
+  result straight into a Unity `RenderTexture` every frame with no CPU
+  readback, and Unity can display and `ReadPixels` it afterwards. The
+  synchronous dispatch (`waitUntilCompleted` on a private command queue)
+  needs no extra synchronization with Unity's renderer.
 
 ## How to run
 
@@ -82,8 +92,7 @@ after rebuilding the plugin.
 
 ## Notes for the next stage (URP cooperation)
 
-- Write results directly into a `RenderTexture` native pointer instead of
-  reading back to the CPU.
 - Use an instance acceleration structure (TLAS) for multiple meshes and
   world-space rays.
-- Integrate with the render thread via `CommandBuffer.IssuePluginEventAndData`.
+- Integrate with the render thread via `CommandBuffer.IssuePluginEventAndData`
+  instead of the synchronous main-thread dispatch.

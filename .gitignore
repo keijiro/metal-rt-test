@@ -1,0 +1,18 @@
+# Unity generated
+/Library/
+/Logs/
+/Temp/
+/UserSettings/
+/obj/
+
+# Test output (regenerated on every run)
+/Output/
+
+# IDE
+/.vs/
+/.idea/
+*.csproj
+*.sln
+
+# macOS
+.DS_Store

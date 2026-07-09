@@ -52,11 +52,11 @@ public sealed class MetalRayTracingTest : MonoBehaviour
        uint triangleCount);
     [DllImport(PluginName)] static extern int MetalRT_BuildInstanceAS
       (InstanceDesc[] instances, int count);
-    [DllImport(PluginName)] static extern int MetalRT_TraceToTexture
-      (in TraceParams traceParams, IntPtr texture);
     [DllImport(PluginName)] static extern int MetalRT_TraceProbes
       (in TraceParams traceParams, Vector4[] rays, int count,
        [Out] ProbeResult[] results);
+    [DllImport(PluginName)] static extern IntPtr MetalRT_GetRenderEventFunc();
+    [DllImport(PluginName)] static extern int MetalRT_GetEventFrameCount();
     [DllImport(PluginName)] static extern void MetalRT_Dispose();
 
     static string LastError
@@ -94,9 +94,19 @@ public sealed class MetalRayTracingTest : MonoBehaviour
     (int mesh, Transform transform)[] _instances;
     RenderTexture _result;
     IntPtr _resultPtr;
-    bool _traceFailed;
+    CommandBuffer _traceCommands;
+    IntPtr _eventFunc;
+    IntPtr[] _eventData;
+    int _eventSlot;
     bool _traceLogged;
     int _tracedFrames;
+
+    // Event data blob layout; must match EventData in MetalRTPlugin.mm.
+    const int MaxInstances = 16;
+    const int EventRingSize = 4;
+    static readonly int ParamsSize = Marshal.SizeOf<TraceParams>();
+    static readonly int DescSize = Marshal.SizeOf<InstanceDesc>();
+    static int EventDataSize => ParamsSize + 16 + DescSize * MaxInstances;
 
     static void Log(string message) => Debug.Log("[MetalRT] " + message);
 
@@ -119,20 +129,31 @@ public sealed class MetalRayTracingTest : MonoBehaviour
 
     void Update()
     {
-        if (_result == null || _traceFailed) return;
+        if (_result == null) return;
 
         // Animate the tori so the per-frame TLAS rebuild visibly stays in
         // sync with the rasterized reference.
         _instances[0].transform.Rotate(0, 20 * Time.deltaTime, 0, Space.World);
         _instances[2].transform.Rotate(15 * Time.deltaTime, 0, 0, Space.Self);
 
-        if (!BuildInstanceAS()) { _traceFailed = true; return; }
         TraceFrame();
 
-        if (++_tracedFrames == 10) SaveResultImage();
+        if (++_tracedFrames == 10)
+        {
+            Log($"Render thread events executed: " +
+                $"{MetalRT_GetEventFrameCount()} (traced frames: " +
+                $"{_tracedFrames}, expected roughly equal)");
+            SaveResultImage();
+        }
     }
 
-    void OnDestroy() => MetalRT_Dispose();
+    void OnDestroy()
+    {
+        MetalRT_Dispose();
+        _traceCommands?.Dispose();
+        if (_eventData != null)
+            foreach (var ptr in _eventData) Marshal.FreeHGlobal(ptr);
+    }
 
     void OnGUI()
     {
@@ -185,7 +206,7 @@ public sealed class MetalRayTracingTest : MonoBehaviour
         go.transform.localScale = Vector3.one * scale;
         go.GetComponent<MeshFilter>().sharedMesh = mesh;
         go.GetComponent<MeshRenderer>().sharedMaterial =
-          _material ??= new Material(Shader.Find("MetalRT/ObjectNormal"));
+          _material ??= new Material(Shader.Find("MetalRT/WorldNormal"));
         return go.transform;
     }
 
@@ -240,27 +261,31 @@ public sealed class MetalRayTracingTest : MonoBehaviour
         return ret;
     }
 
-    // Per-frame TLAS rebuild from the current scene transforms
+    // TLAS instance descriptors from the current scene transforms
 
+    InstanceDesc MakeInstanceDesc(int index)
+    {
+        var (meshIndex, transform) = _instances[index];
+        var l2w = transform.localToWorldMatrix;
+        var nrm = l2w.inverse.transpose;
+        return new InstanceDesc
+        {
+            meshIndex = meshIndex,
+            objectToWorld0 = l2w.GetRow(0),
+            objectToWorld1 = l2w.GetRow(1),
+            objectToWorld2 = l2w.GetRow(2),
+            normalMatrix0 = nrm.GetRow(0),
+            normalMatrix1 = nrm.GetRow(1),
+            normalMatrix2 = nrm.GetRow(2)
+        };
+    }
+
+    // Synchronous TLAS build used by the probe test path.
     bool BuildInstanceAS()
     {
         var descs = new InstanceDesc[_instances.Length];
         for (var i = 0; i < _instances.Length; i++)
-        {
-            var (meshIndex, transform) = _instances[i];
-            var l2w = transform.localToWorldMatrix;
-            var nrm = l2w.inverse.transpose;
-            descs[i] = new InstanceDesc
-            {
-                meshIndex = meshIndex,
-                objectToWorld0 = l2w.GetRow(0),
-                objectToWorld1 = l2w.GetRow(1),
-                objectToWorld2 = l2w.GetRow(2),
-                normalMatrix0 = nrm.GetRow(0),
-                normalMatrix1 = nrm.GetRow(1),
-                normalMatrix2 = nrm.GetRow(2)
-            };
-        }
+            descs[i] = MakeInstanceDesc(i);
 
         var ret = MetalRT_BuildInstanceAS(descs, descs.Length);
         if (ret != 0)
@@ -269,9 +294,8 @@ public sealed class MetalRayTracingTest : MonoBehaviour
             return false;
         }
 
-        if (_tracedFrames == 0)
-            Log($"Instance AS (TLAS) built with {descs.Length} instances " +
-                $"over {_meshes.Length} BLASes: OK");
+        Log($"Instance AS (TLAS) built with {descs.Length} instances " +
+            $"over {_meshes.Length} BLASes: OK");
         return true;
     }
 
@@ -319,7 +343,9 @@ public sealed class MetalRayTracingTest : MonoBehaviour
             (passed == Probes.Length ? " -- ALL PASS" : " -- FAILURE"));
     }
 
-    // Visual test: per-frame full trace written directly into a RenderTexture
+    // Visual test: per-frame TLAS rebuild and full trace, encoded into
+    // Unity's own Metal command stream on the render thread via
+    // CommandBuffer.IssuePluginEventAndData (no CPU stall).
 
     void SetUpRenderTarget()
     {
@@ -329,6 +355,15 @@ public sealed class MetalRayTracingTest : MonoBehaviour
         _result.Create();
         _resultPtr = _result.GetNativeTexturePtr();
         Log($"RenderTexture ({w}x{h}) created; native ptr acquired");
+
+        _eventFunc = MetalRT_GetRenderEventFunc();
+        _traceCommands = new CommandBuffer { name = "MetalRT Trace" };
+
+        // A small ring of unmanaged blobs so the render thread never reads
+        // a blob the main thread is currently rewriting.
+        _eventData = new IntPtr[EventRingSize];
+        for (var i = 0; i < EventRingSize; i++)
+            _eventData[i] = Marshal.AllocHGlobal(EventDataSize);
     }
 
     void TraceFrame()
@@ -347,19 +382,33 @@ public sealed class MetalRayTracingTest : MonoBehaviour
             height = (uint)h
         };
 
-        var ret = MetalRT_TraceToTexture(p, _resultPtr);
-        if (ret != 0)
-        {
-            _traceFailed = true;
-            Log($"FAIL: Texture trace error {ret}: {LastError}");
-            return;
-        }
+        _traceCommands.Clear();
+        _traceCommands.IssuePluginEventAndData(_eventFunc, 0, WriteEventData(p));
+        Graphics.ExecuteCommandBuffer(_traceCommands);
 
         if (!_traceLogged)
         {
             _traceLogged = true;
-            Log("Direct RenderTexture write: OK (tracing every frame)");
+            Log("Render thread trace path active " +
+                "(TLAS rebuild + trace on Unity's command stream)");
         }
+    }
+
+    // Serializes this frame's trace parameters and instance descriptors into
+    // the next unmanaged blob of the ring.
+    IntPtr WriteEventData(in TraceParams p)
+    {
+        _eventSlot = (_eventSlot + 1) % EventRingSize;
+        var ptr = _eventData[_eventSlot];
+        Marshal.StructureToPtr(p, ptr, false);
+        Marshal.WriteInt64(ptr, ParamsSize, _resultPtr.ToInt64());
+        Marshal.WriteInt32(ptr, ParamsSize + 8, _instances.Length);
+        Marshal.WriteInt32(ptr, ParamsSize + 12, 0);
+        for (var i = 0; i < _instances.Length; i++)
+            Marshal.StructureToPtr
+              (MakeInstanceDesc(i),
+               IntPtr.Add(ptr, ParamsSize + 16 + DescSize * i), false);
+        return ptr;
     }
 
     // Reads the natively written RenderTexture back on the Unity side, which

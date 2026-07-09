@@ -1,4 +1,4 @@
-Shader "MetalRT/ObjectNormal"
+Shader "MetalRT/WorldNormal"
 {
 
 HLSLINCLUDE
@@ -11,7 +11,7 @@ void Vert(float4 position : POSITION,
           out float3 outNormal : TEXCOORD0)
 {
     outPosition = UnityObjectToClipPos(position);
-    outNormal = normal;
+    outNormal = UnityObjectToWorldNormal(normal);
 }
 
 float4 Frag(float4 position : SV_Position,
@@ -26,7 +26,7 @@ ENDHLSL
     {
         Pass
         {
-            Name "ObjectNormal"
+            Name "WorldNormal"
             HLSLPROGRAM
             #pragma vertex Vert
             #pragma fragment Frag

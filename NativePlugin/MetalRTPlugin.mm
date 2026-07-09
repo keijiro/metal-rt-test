@@ -6,15 +6,24 @@
 // structure (TLAS) with per-instance transforms, and runs world-space
 // intersection tests with metal::raytracing::intersector in compute kernels.
 // Per-instance vertex/index buffers are accessed bindlessly through GPU
-// addresses (Metal 3). All work runs synchronously on a private command
-// queue created on Unity's MTLDevice, so no synchronization with Unity's
-// render thread is needed.
+// addresses (Metal 3).
+//
+// Two execution paths are provided:
+// - Synchronous: BLAS builds and probe traces run on a private command queue
+//   with waitUntilCompleted (main thread, used for one-time setup and the
+//   data-level tests).
+// - Render thread: the per-frame TLAS rebuild and full-frame trace are
+//   encoded directly into Unity's own Metal command buffer from a plugin
+//   render event (CommandBuffer.IssuePluginEventAndData), so the work is
+//   sequenced with Unity's rendering on the GPU with no CPU stall.
 
 #import <Metal/Metal.h>
 
 #include "IUnityInterface.h"
+#include "IUnityGraphics.h"
 #include "IUnityGraphicsMetal.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -36,9 +45,13 @@ struct MeshEntry
     uint32_t vertexStride, positionOffset, indexFormat;
 };
 
+// Written on the main thread during setup (before any render event fires),
+// read from the render thread afterwards.
 std::vector<MeshEntry> s_Meshes;
-id<MTLAccelerationStructure> s_InstanceAS;
-id<MTLBuffer> s_InstanceInfo;
+id<MTLAccelerationStructure> s_InstanceAS; // synchronous path only
+id<MTLBuffer> s_InstanceInfo;              // synchronous path only
+
+std::atomic<int> s_EventFrames {0};
 
 std::string s_LastError;
 
@@ -66,6 +79,18 @@ struct InstanceDesc
     float pad[3];
     float objectToWorld[3][4]; // rows of the 3x4 object-to-world matrix
     float normalMatrix[3][4];  // rows (xyz used) of the world normal matrix
+};
+
+constexpr int kMaxEventInstances = 16;
+
+// Must match the event data blob layout in MetalRayTracingTest.cs.
+struct EventData
+{
+    TraceParams params;
+    uint64_t texture; // MTLTexture pointer (RenderTexture native ptr)
+    int32_t instanceCount;
+    uint32_t pad;
+    InstanceDesc instances[kMaxEventInstances];
 };
 
 // Shader-side per-instance record; must match InstanceInfo in the shader
@@ -303,8 +328,72 @@ bool RunCommandBuffer(id<MTLCommandBuffer> command)
     return true;
 }
 
-id<MTLAccelerationStructure> BuildAccelerationStructure
-  (MTLAccelerationStructureDescriptor* descriptor)
+// Fills Metal instance descriptors and the shader-side instance records
+// from marshaled instance data. Returns nil on error.
+MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
+  (const InstanceDesc* instances, int32_t count, id<MTLBuffer>* outInfo)
+{
+    id<MTLBuffer> descBuffer = [s_Device
+      newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor)
+                          * count
+                  options:MTLResourceStorageModeShared];
+    id<MTLBuffer> infoBuffer = [s_Device
+      newBufferWithLength:sizeof(GpuInstanceInfo) * count
+                  options:MTLResourceStorageModeShared];
+
+    auto* descs = (MTLAccelerationStructureInstanceDescriptor*)
+      descBuffer.contents;
+    auto* infos = (GpuInstanceInfo*)infoBuffer.contents;
+
+    for (int32_t i = 0; i < count; i++)
+    {
+        const InstanceDesc& src = instances[i];
+        if (src.meshIndex < 0 || src.meshIndex >= (int32_t)s_Meshes.size())
+        {
+            SetError(@"Instance references an invalid mesh index.");
+            return nil;
+        }
+        const MeshEntry& mesh = s_Meshes[src.meshIndex];
+
+        MTLAccelerationStructureInstanceDescriptor& desc = descs[i];
+        for (int c = 0; c < 4; c++)
+            desc.transformationMatrix.columns[c] =
+              MTLPackedFloat3Make(src.objectToWorld[0][c],
+                                  src.objectToWorld[1][c],
+                                  src.objectToWorld[2][c]);
+        desc.options = MTLAccelerationStructureInstanceOptionOpaque;
+        desc.mask = 0xff;
+        desc.intersectionFunctionTableOffset = 0;
+        desc.accelerationStructureIndex = src.meshIndex;
+
+        GpuInstanceInfo& info = infos[i];
+        info.vertices = mesh.vertexBuffer.gpuAddress;
+        info.indices = mesh.indexBuffer.gpuAddress;
+        info.vertexStride = mesh.vertexStride;
+        info.positionOffset = mesh.positionOffset;
+        info.indexFormat = mesh.indexFormat;
+        info.pad = 0;
+        std::memcpy(info.normalMatrix, src.normalMatrix,
+                    sizeof(info.normalMatrix));
+    }
+
+    NSMutableArray* blases = [NSMutableArray arrayWithCapacity:s_Meshes.size()];
+    for (const auto& mesh : s_Meshes) [blases addObject:mesh.blas];
+
+    MTLInstanceAccelerationStructureDescriptor* descriptor =
+      [MTLInstanceAccelerationStructureDescriptor descriptor];
+    descriptor.instancedAccelerationStructures = blases;
+    descriptor.instanceCount = count;
+    descriptor.instanceDescriptorBuffer = descBuffer;
+
+    *outInfo = infoBuffer;
+    return descriptor;
+}
+
+// Encodes an acceleration structure build onto the given command buffer.
+// Returns the (not yet built) acceleration structure object.
+id<MTLAccelerationStructure> EncodeAccelerationStructureBuild
+  (id<MTLCommandBuffer> command, MTLAccelerationStructureDescriptor* descriptor)
 {
     MTLAccelerationStructureSizes sizes =
       [s_Device accelerationStructureSizesWithDescriptor:descriptor];
@@ -320,7 +409,6 @@ id<MTLAccelerationStructure> BuildAccelerationStructure
         return nil;
     }
 
-    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
     id<MTLAccelerationStructureCommandEncoder> encoder =
       [command accelerationStructureCommandEncoder];
     [encoder buildAccelerationStructure:accel
@@ -328,39 +416,76 @@ id<MTLAccelerationStructure> BuildAccelerationStructure
                           scratchBuffer:scratch
                     scratchBufferOffset:0];
     [encoder endEncoding];
+    return accel;
+}
 
+id<MTLAccelerationStructure> BuildAccelerationStructureSync
+  (MTLAccelerationStructureDescriptor* descriptor)
+{
+    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
+    id<MTLAccelerationStructure> accel =
+      EncodeAccelerationStructureBuild(command, descriptor);
+    if (accel == nil) return nil;
     return RunCommandBuffer(command) ? accel : nil;
 }
 
-// Marks all indirectly referenced resources (BLASes and bindlessly accessed
-// mesh buffers) resident for the dispatch.
-void UseMeshResources(id<MTLComputeCommandEncoder> encoder)
+// Encodes the full-frame trace dispatch onto the given command buffer.
+void EncodeTrace(id<MTLCommandBuffer> command,
+                 id<MTLAccelerationStructure> tlas, id<MTLBuffer> info,
+                 const TraceParams* params, id<MTLTexture> texture)
 {
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:s_TexturePipeline];
+    [encoder setAccelerationStructure:tlas atBufferIndex:0];
+    [encoder setBytes:params length:sizeof(TraceParams) atIndex:1];
+    [encoder setBuffer:info offset:0 atIndex:2];
+    [encoder setTexture:texture atIndex:0];
     for (const auto& mesh : s_Meshes)
     {
         [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
         [encoder useResource:mesh.vertexBuffer usage:MTLResourceUsageRead];
         [encoder useResource:mesh.indexBuffer usage:MTLResourceUsageRead];
     }
+    [encoder dispatchThreads:MTLSizeMake(params->width, params->height, 1)
+       threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
 }
 
-bool DispatchTrace(id<MTLComputePipelineState> pipeline,
-                   const TraceParams* params,
-                   void (^bind)(id<MTLComputeCommandEncoder>),
-                   MTLSize grid, MTLSize group)
+// Render thread entry point (CommandBuffer.IssuePluginEventAndData). Encodes
+// the per-frame TLAS rebuild and trace directly into Unity's current Metal
+// command buffer, so the work is GPU-ordered with Unity's rendering and the
+// CPU never blocks.
+void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
 {
-    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (s_Metal == nullptr || data == nullptr) return;
+    if (!EnsureDevice() || !EnsurePipelines()) return;
 
-    [encoder setComputePipelineState:pipeline];
-    [encoder setAccelerationStructure:s_InstanceAS atBufferIndex:0];
-    [encoder setBytes:params length:sizeof(TraceParams) atIndex:1];
-    UseMeshResources(encoder);
-    bind(encoder);
-    [encoder dispatchThreads:grid threadsPerThreadgroup:group];
-    [encoder endEncoding];
+    const auto* ev = (const EventData*)data;
+    if (ev->instanceCount <= 0 || ev->instanceCount > kMaxEventInstances)
+        return;
 
-    return RunCommandBuffer(command);
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)ev->texture;
+    if (texture == nil || !(texture.usage & MTLTextureUsageShaderWrite))
+        return;
+
+    id<MTLBuffer> info = nil;
+    MTLInstanceAccelerationStructureDescriptor* descriptor =
+      CreateInstanceDescriptor(ev->instances, ev->instanceCount, &info);
+    if (descriptor == nil) return;
+
+    // End Unity's in-flight encoder so we can put our own encoders on its
+    // command buffer; Unity opens a new encoder afterwards as needed.
+    s_Metal->EndCurrentCommandEncoder();
+    id<MTLCommandBuffer> command = s_Metal->CurrentCommandBuffer();
+    if (command == nil) return;
+
+    id<MTLAccelerationStructure> tlas =
+      EncodeAccelerationStructureBuild(command, descriptor);
+    if (tlas == nil) return;
+
+    EncodeTrace(command, tlas, info, &ev->params, texture);
+
+    s_EventFrames.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // anonymous namespace
@@ -392,8 +517,8 @@ MetalRT_DeviceSupportsRaytracing()
     return s_Device.supportsRaytracing ? 1 : 0;
 }
 
-// Registers a mesh and builds its BLAS. Returns the mesh index (>= 0) on
-// success or a negative error code.
+// Registers a mesh and builds its BLAS synchronously. Returns the mesh
+// index (>= 0) on success or a negative error code.
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_AddMesh
   (void* vertexBuffer, uint32_t vertexStride, uint32_t positionOffset,
@@ -432,16 +557,15 @@ MetalRT_AddMesh
       [MTLPrimitiveAccelerationStructureDescriptor descriptor];
     descriptor.geometryDescriptors = @[geometry];
 
-    mesh.blas = BuildAccelerationStructure(descriptor);
+    mesh.blas = BuildAccelerationStructureSync(descriptor);
     if (mesh.blas == nil) return -3;
 
     s_Meshes.push_back(mesh);
     return (int)s_Meshes.size() - 1;
 }
 
-// (Re)builds the instance acceleration structure (TLAS) and the shader-side
-// per-instance records. Cheap enough to call every frame with updated
-// transforms.
+// Synchronously (re)builds the instance acceleration structure used by the
+// probe test path.
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_BuildInstanceAS(const InstanceDesc* instances, int32_t count)
 {
@@ -453,95 +577,16 @@ MetalRT_BuildInstanceAS(const InstanceDesc* instances, int32_t count)
         return -2;
     }
 
-    id<MTLBuffer> descBuffer = [s_Device
-      newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor)
-                          * count
-                  options:MTLResourceStorageModeShared];
-    id<MTLBuffer> infoBuffer = [s_Device
-      newBufferWithLength:sizeof(GpuInstanceInfo) * count
-                  options:MTLResourceStorageModeShared];
-
-    auto* descs = (MTLAccelerationStructureInstanceDescriptor*)
-      descBuffer.contents;
-    auto* infos = (GpuInstanceInfo*)infoBuffer.contents;
-
-    for (int32_t i = 0; i < count; i++)
-    {
-        const InstanceDesc& src = instances[i];
-        if (src.meshIndex < 0 || src.meshIndex >= (int32_t)s_Meshes.size())
-        {
-            SetError(@"Instance references an invalid mesh index.");
-            return -3;
-        }
-        const MeshEntry& mesh = s_Meshes[src.meshIndex];
-
-        MTLAccelerationStructureInstanceDescriptor& desc = descs[i];
-        for (int c = 0; c < 4; c++)
-            desc.transformationMatrix.columns[c] =
-              MTLPackedFloat3Make(src.objectToWorld[0][c],
-                                  src.objectToWorld[1][c],
-                                  src.objectToWorld[2][c]);
-        desc.options = MTLAccelerationStructureInstanceOptionOpaque;
-        desc.mask = 0xff;
-        desc.intersectionFunctionTableOffset = 0;
-        desc.accelerationStructureIndex = src.meshIndex;
-
-        GpuInstanceInfo& info = infos[i];
-        info.vertices = mesh.vertexBuffer.gpuAddress;
-        info.indices = mesh.indexBuffer.gpuAddress;
-        info.vertexStride = mesh.vertexStride;
-        info.positionOffset = mesh.positionOffset;
-        info.indexFormat = mesh.indexFormat;
-        info.pad = 0;
-        std::memcpy(info.normalMatrix, src.normalMatrix,
-                    sizeof(info.normalMatrix));
-    }
-
-    NSMutableArray* blases = [NSMutableArray arrayWithCapacity:s_Meshes.size()];
-    for (const auto& mesh : s_Meshes) [blases addObject:mesh.blas];
-
+    id<MTLBuffer> info = nil;
     MTLInstanceAccelerationStructureDescriptor* descriptor =
-      [MTLInstanceAccelerationStructureDescriptor descriptor];
-    descriptor.instancedAccelerationStructures = blases;
-    descriptor.instanceCount = count;
-    descriptor.instanceDescriptorBuffer = descBuffer;
+      CreateInstanceDescriptor(instances, count, &info);
+    if (descriptor == nil) return -3;
 
-    s_InstanceAS = BuildAccelerationStructure(descriptor);
+    s_InstanceAS = BuildAccelerationStructureSync(descriptor);
     if (s_InstanceAS == nil) return -4;
 
-    s_InstanceInfo = infoBuffer;
+    s_InstanceInfo = info;
     return 0;
-}
-
-// Writes directly into a Unity RenderTexture (created with
-// enableRandomWrite) given its GetNativeTexturePtr. The dispatch completes
-// synchronously, so Unity can sample the texture afterwards without any
-// extra synchronization.
-int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
-MetalRT_TraceToTexture(const TraceParams* params, void* texturePtr)
-{
-    if (s_InstanceAS == nil)
-    {
-        SetError(@"Instance acceleration structure has not been built.");
-        return -1;
-    }
-    if (!EnsurePipelines()) return -2;
-
-    id<MTLTexture> texture = (__bridge id<MTLTexture>)texturePtr;
-    if (texture == nil || !(texture.usage & MTLTextureUsageShaderWrite))
-    {
-        SetError(@"Target texture is nil or lacks shader write usage.");
-        return -3;
-    }
-
-    bool ok = DispatchTrace(
-      s_TexturePipeline, params,
-      ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBuffer:s_InstanceInfo offset:0 atIndex:2];
-          [encoder setTexture:texture atIndex:0];
-      },
-      MTLSizeMake(params->width, params->height, 1), MTLSizeMake(8, 8, 1));
-    return ok ? 0 : -4;
 }
 
 // rays: (origin.xyzw, direction.xyzw) float4 pairs in world space
@@ -560,18 +605,42 @@ MetalRT_TraceProbes(const TraceParams* params,
     id<MTLBuffer> output =
       [s_Device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
-    bool ok = DispatchTrace(
-      s_ProbePipeline, params,
-      ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBuffer:output offset:0 atIndex:2];
-          [encoder setBuffer:s_InstanceInfo offset:0 atIndex:3];
-          [encoder setBytes:rays length:sizeof(float) * 8 * count atIndex:4];
-      },
-      MTLSizeMake(count, 1, 1), MTLSizeMake(1, 1, 1));
-    if (!ok) return -3;
+    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:s_ProbePipeline];
+    [encoder setAccelerationStructure:s_InstanceAS atBufferIndex:0];
+    [encoder setBytes:params length:sizeof(TraceParams) atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    [encoder setBuffer:s_InstanceInfo offset:0 atIndex:3];
+    [encoder setBytes:rays length:sizeof(float) * 8 * count atIndex:4];
+    for (const auto& mesh : s_Meshes)
+    {
+        [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
+        [encoder useResource:mesh.vertexBuffer usage:MTLResourceUsageRead];
+        [encoder useResource:mesh.indexBuffer usage:MTLResourceUsageRead];
+    }
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
+
+    if (!RunCommandBuffer(command)) return -3;
 
     std::memcpy(results, output.contents, size);
     return 0;
+}
+
+// Returns the render event callback for CommandBuffer.IssuePluginEventAndData.
+UnityRenderingEventAndData UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
+MetalRT_GetRenderEventFunc()
+{
+    return OnRenderEvent;
+}
+
+// Number of render events executed so far (verifies the render thread path).
+int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
+MetalRT_GetEventFrameCount()
+{
+    return s_EventFrames.load(std::memory_order_relaxed);
 }
 
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
@@ -579,6 +648,7 @@ void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
     s_InstanceAS = nil;
     s_InstanceInfo = nil;
     s_Meshes.clear();
+    s_EventFrames.store(0, std::memory_order_relaxed);
 }
 
 } // extern "C"

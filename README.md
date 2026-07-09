@@ -40,8 +40,14 @@ project.
   embedded MSL source) that trace world-space rays with
   `raytracing::intersector<triangle_data, instancing>`. Per-instance
   vertex/index buffers for hit shading are accessed bindlessly through GPU
-  addresses (`MTLBuffer.gpuAddress`, Metal 3). All GPU work runs synchronously
-  on a private command queue, independent of Unity's render thread.
+  addresses (`MTLBuffer.gpuAddress`, Metal 3). One-time setup (BLAS builds)
+  and the probe tests run synchronously on a private command queue; the
+  per-frame TLAS rebuild and full-frame trace are encoded directly into
+  Unity's own Metal command buffer on the render thread — a plugin render
+  event ends Unity's current command encoder (`EndCurrentCommandEncoder`),
+  adds an acceleration structure build encoder and a compute encoder to
+  `CurrentCommandBuffer`, and returns. The work is GPU-ordered with Unity's
+  rendering and the CPU never blocks.
 - `Assets/Scripts/MetalRayTracingTest.cs` — The test driver. It requires no
   scene setup (it bootstraps itself via `RuntimeInitializeOnLoadMethod`) and:
   - Loads the torus and sphere meshes, which are non-readable by default as
@@ -55,15 +61,18 @@ project.
   - Runs world-space probe rays with analytically derived expectations
     (hit distances, hit instance indices, misses through the torus hole) and
     logs PASS/FAIL.
-  - Traces a full frame from the scene camera every frame, written by the
-    native plugin directly into a Unity `RenderTexture` (created with
-    `enableRandomWrite` and passed as `GetNativeTexturePtr`), and shows it
-    next to a rasterized reference: left half is a normal `MeshRenderer`
-    drawing object-space normals, right half is the ray traced result colored
-    by geometric normals. The tori rotate so the two views can be seen
-    staying in sync. Matching silhouettes and colors confirm correct
-    intersections. The texture is also read back with `ReadPixels` and saved
-    to `Output/rt-result.png`, verifying that natively written contents are
+  - Traces a full frame from the scene camera every frame, dispatched on the
+    render thread through `CommandBuffer.IssuePluginEventAndData` (per-frame
+    parameters and instance transforms are passed in a small ring of
+    unmanaged blobs) and written by the native plugin directly into a Unity
+    `RenderTexture` (created with `enableRandomWrite` and passed as
+    `GetNativeTexturePtr`). The result is shown next to a rasterized
+    reference: left half is a normal `MeshRenderer` drawing world-space
+    normals, right half is the ray traced result colored by world-space
+    geometric normals. The tori rotate so the two views can be seen staying
+    in sync. Matching silhouettes and colors confirm correct intersections.
+    The texture is also read back with `ReadPixels` and saved to
+    `Output/rt-result.png`, verifying that natively written contents are
     visible to Unity.
 - `Assets/Resources/Torus.obj`, `Sphere.obj` — Generated test meshes (torus:
   major radius 1.0, minor radius 0.4, 4096 triangles; UV sphere: radius 0.5,
@@ -89,9 +98,12 @@ Verified on Unity 6000.3.19f1 / macOS / Apple M4 Max:
   silhouette and normal color distribution (see `Images/comparison.png`).
 - Direct `RenderTexture` write: **OK** — the native plugin writes the trace
   result straight into a Unity `RenderTexture` every frame with no CPU
-  readback, and Unity can display and `ReadPixels` it afterwards. The
-  synchronous dispatch (`waitUntilCompleted` on a private command queue)
-  needs no extra synchronization with Unity's renderer.
+  readback, and Unity can display and `ReadPixels` it afterwards.
+- Render thread integration: **OK** — the per-frame TLAS rebuild and trace
+  are encoded into Unity's current Metal command buffer from a
+  `IssuePluginEventAndData` render event, with no `waitUntilCompleted` on
+  the frame path. Display, `ReadPixels`, and animated instances all stay
+  correctly ordered with Unity's rendering.
 
 ## How to run
 
@@ -106,5 +118,9 @@ after rebuilding the plugin.
 
 ## Notes for the next stage (URP cooperation)
 
-- Integrate with the render thread via `CommandBuffer.IssuePluginEventAndData`
-  instead of the synchronous main-thread dispatch.
+All the building blocks for URP integration are now verified: acceleration
+structures from engine meshes, TLAS instancing from scene transforms, direct
+`RenderTexture` output, and render-thread scheduling inside Unity's command
+stream. The remaining work is URP-specific plumbing — driving the plugin
+event from a `ScriptableRenderPass` and consuming URP's cameras and render
+targets instead of the test harness.

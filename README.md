@@ -33,31 +33,41 @@ project.
 ## How it works
 
 - `NativePlugin/MetalRTPlugin.mm` — The native plugin. It obtains Unity's
-  `MTLDevice` through `IUnityGraphicsMetalV1`, builds a primitive acceleration
-  structure directly from the mesh GPU buffers, and dispatches compute kernels
-  (compiled at runtime from embedded MSL source) that trace rays with
-  `raytracing::intersector`. All GPU work runs synchronously on a private
-  command queue, independent of Unity's render thread.
+  `MTLDevice` through `IUnityGraphicsMetalV1`, builds per-mesh primitive
+  acceleration structures (BLAS) directly from the mesh GPU buffers, combines
+  them into an instance acceleration structure (TLAS) with per-instance
+  transforms, and dispatches compute kernels (compiled at runtime from
+  embedded MSL source) that trace world-space rays with
+  `raytracing::intersector<triangle_data, instancing>`. Per-instance
+  vertex/index buffers for hit shading are accessed bindlessly through GPU
+  addresses (`MTLBuffer.gpuAddress`, Metal 3). All GPU work runs synchronously
+  on a private command queue, independent of Unity's render thread.
 - `Assets/Scripts/MetalRayTracingTest.cs` — The test driver. It requires no
   scene setup (it bootstraps itself via `RuntimeInitializeOnLoadMethod`) and:
-  - Loads the torus mesh, which is non-readable by default as an imported
-    model asset, and passes its native vertex/index buffer pointers
-    (`Mesh.GetNativeVertexBufferPtr` / `GetNativeIndexBufferPtr`) to the
-    plugin — no CPU-side mesh data is ever touched.
-  - Runs probe rays with analytically derived expectations for the torus
-    (hit distances, misses through the hole) and logs PASS/FAIL.
+  - Loads the torus and sphere meshes, which are non-readable by default as
+    imported model assets, and passes their native vertex/index buffer
+    pointers (`Mesh.GetNativeVertexBufferPtr` / `GetNativeIndexBufferPtr`) to
+    the plugin to build one BLAS per mesh — no CPU-side mesh data is ever
+    touched.
+  - Places three instances (two tori sharing one BLAS, one sphere) and
+    rebuilds the TLAS from their `Transform`s every frame, so animated
+    transforms are picked up.
+  - Runs world-space probe rays with analytically derived expectations
+    (hit distances, hit instance indices, misses through the torus hole) and
+    logs PASS/FAIL.
   - Traces a full frame from the scene camera every frame, written by the
     native plugin directly into a Unity `RenderTexture` (created with
     `enableRandomWrite` and passed as `GetNativeTexturePtr`), and shows it
     next to a rasterized reference: left half is a normal `MeshRenderer`
     drawing object-space normals, right half is the ray traced result colored
-    by geometric normals. The target mesh rotates so the two views can be
-    seen staying in sync. Matching silhouettes and colors confirm correct
+    by geometric normals. The tori rotate so the two views can be seen
+    staying in sync. Matching silhouettes and colors confirm correct
     intersections. The texture is also read back with `ReadPixels` and saved
     to `Output/rt-result.png`, verifying that natively written contents are
     visible to Unity.
-- `Assets/Resources/Torus.obj` — Generated test mesh (major radius 1.0, minor
-  radius 0.4, 4096 triangles).
+- `Assets/Resources/Torus.obj`, `Sphere.obj` — Generated test meshes (torus:
+  major radius 1.0, minor radius 0.4, 4096 triangles; UV sphere: radius 0.5,
+  960 triangles).
 
 ## Results
 
@@ -66,11 +76,15 @@ Verified on Unity 6000.3.19f1 / macOS / Apple M4 Max:
 - `SystemInfo.supportsRayTracing == false` on Metal (Unity API path is
   unavailable, as expected).
 - Native `MTLDevice.supportsRaytracing == true`.
-- Acceleration structure build from a non-readable mesh: **OK** — the GPU
+- Acceleration structure build from non-readable meshes: **OK** — the GPU
   buffers of a `Mesh` with `isReadable == false` can be consumed directly by
   `MTLAccelerationStructureTriangleGeometryDescriptor`.
+- Instance acceleration structure (TLAS): **OK** — three instances over two
+  BLASes, rebuilt every frame from scene transforms (animated instances stay
+  in sync with the rasterized reference), with bindless per-instance buffer
+  access for hit shading.
 - Probe ray tests: **5/5 passed**, hit distances matching analytic values
-  within 0.02.
+  within 0.02 and hit instance indices matching the expected instances.
 - Visual test: the ray traced image matches the rasterized reference in
   silhouette and normal color distribution (see `Images/comparison.png`).
 - Direct `RenderTexture` write: **OK** — the native plugin writes the trace
@@ -92,7 +106,5 @@ after rebuilding the plugin.
 
 ## Notes for the next stage (URP cooperation)
 
-- Use an instance acceleration structure (TLAS) for multiple meshes and
-  world-space rays.
 - Integrate with the render thread via `CommandBuffer.IssuePluginEventAndData`
   instead of the synchronous main-thread dispatch.

@@ -1,11 +1,14 @@
 // Metal hardware ray tracing test plugin for Unity
 //
-// Builds a MTLAccelerationStructure directly from Unity mesh GPU buffers
-// (obtained via Mesh.GetNativeVertexBufferPtr / GetNativeIndexBufferPtr) and
-// runs intersection tests with metal::raytracing::intersector in a compute
-// kernel. All work runs synchronously on a private command queue created on
-// Unity's MTLDevice, so no synchronization with Unity's render thread is
-// needed.
+// Builds per-mesh primitive acceleration structures (BLAS) directly from
+// Unity mesh GPU buffers (obtained via Mesh.GetNativeVertexBufferPtr /
+// GetNativeIndexBufferPtr), combines them into an instance acceleration
+// structure (TLAS) with per-instance transforms, and runs world-space
+// intersection tests with metal::raytracing::intersector in compute kernels.
+// Per-instance vertex/index buffers are accessed bindlessly through GPU
+// addresses (Metal 3). All work runs synchronously on a private command
+// queue created on Unity's MTLDevice, so no synchronization with Unity's
+// render thread is needed.
 
 #import <Metal/Metal.h>
 
@@ -14,6 +17,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -21,33 +25,57 @@ IUnityGraphicsMetalV1* s_Metal;
 
 id<MTLDevice> s_Device;
 id<MTLCommandQueue> s_Queue;
-id<MTLComputePipelineState> s_ImagePipeline;
 id<MTLComputePipelineState> s_TexturePipeline;
 id<MTLComputePipelineState> s_ProbePipeline;
 
-id<MTLAccelerationStructure> s_Accel;
-id<MTLBuffer> s_VertexBuffer;
-id<MTLBuffer> s_IndexBuffer;
+struct MeshEntry
+{
+    id<MTLAccelerationStructure> blas;
+    id<MTLBuffer> vertexBuffer;
+    id<MTLBuffer> indexBuffer;
+    uint32_t vertexStride, positionOffset, indexFormat;
+};
+
+std::vector<MeshEntry> s_Meshes;
+id<MTLAccelerationStructure> s_InstanceAS;
+id<MTLBuffer> s_InstanceInfo;
 
 std::string s_LastError;
 
 // Must match TraceParams in MetalRayTracingTest.cs and in the shader source.
 struct TraceParams
 {
-    float originTan[4];   // xyz: ray origin (object space), w: tan(fovY/2)
-    float rightAspect[4]; // xyz: camera right (object space), w: aspect
-    float up[4];          // xyz: camera up (object space)
-    float forward[4];     // xyz: camera forward (object space)
-    uint32_t width, height, vertexStride, posOffset;
-    uint32_t indexFormat; // 0: UInt16, 1: UInt32
-    uint32_t pad[3];
+    float originTan[4];   // xyz: ray origin (world space), w: tan(fovY/2)
+    float rightAspect[4]; // xyz: camera right (world space), w: aspect
+    float up[4];          // xyz: camera up (world space)
+    float forward[4];     // xyz: camera forward (world space)
+    uint32_t width, height, pad0, pad1;
 };
 
 // Must match ProbeResult in MetalRayTracingTest.cs.
 struct ProbeResult
 {
-    float hit, distance, primitiveIndex, pad;
-    float barycentric[2], pad2[2];
+    float hit, distance, primitiveIndex, instanceIndex;
+    float barycentric[2], pad[2];
+};
+
+// Must match InstanceDesc in MetalRayTracingTest.cs.
+struct InstanceDesc
+{
+    int32_t meshIndex;
+    float pad[3];
+    float objectToWorld[3][4]; // rows of the 3x4 object-to-world matrix
+    float normalMatrix[3][4];  // rows (xyz used) of the world normal matrix
+};
+
+// Shader-side per-instance record; must match InstanceInfo in the shader
+// source. Buffer pointers are stored as raw GPU addresses (Metal 3
+// bindless), which the shader reads as device pointers.
+struct GpuInstanceInfo
+{
+    uint64_t vertices, indices;
+    uint32_t vertexStride, positionOffset, indexFormat, pad;
+    float normalMatrix[3][4];
 };
 
 constexpr const char* kShaderSource = R"msl(
@@ -63,15 +91,21 @@ struct TraceParams
     float4 rightAspect;
     float4 up;
     float4 forward;
-    uint width, height, vertexStride, posOffset;
-    uint indexFormat;
-    uint pad[3];
+    uint width, height, pad0, pad1;
 };
 
 struct ProbeResult
 {
-    float hit, distance, primitiveIndex, pad;
-    float2 barycentric, pad2;
+    float hit, distance, primitiveIndex, instanceIndex;
+    float2 barycentric, pad;
+};
+
+struct InstanceInfo
+{
+    device const uchar* vertices;
+    device const uchar* indices;
+    uint vertexStride, positionOffset, indexFormat, pad;
+    float4 normalMatrix0, normalMatrix1, normalMatrix2;
 };
 
 static ray GenerateRay(constant TraceParams& params, float2 ndc)
@@ -89,95 +123,81 @@ static ray GenerateRay(constant TraceParams& params, float2 ndc)
     return r;
 }
 
-static uint3 LoadTriangleIndices
-  (constant TraceParams& params, device const uchar* indices, uint prim)
+static uint3 LoadTriangleIndices(constant InstanceInfo& info, uint prim)
 {
-    if (params.indexFormat == 0)
+    if (info.indexFormat == 0)
     {
-        device const ushort* p = (device const ushort*)indices;
+        device const ushort* p = (device const ushort*)info.indices;
         return uint3(p[prim * 3], p[prim * 3 + 1], p[prim * 3 + 2]);
     }
     else
     {
-        device const uint* p = (device const uint*)indices;
+        device const uint* p = (device const uint*)info.indices;
         return uint3(p[prim * 3], p[prim * 3 + 1], p[prim * 3 + 2]);
     }
 }
 
-static float3 LoadPosition
-  (constant TraceParams& params, device const uchar* vertices, uint index)
+static float3 LoadPosition(constant InstanceInfo& info, uint index)
 {
     device const packed_float3* p = (device const packed_float3*)
-      (vertices + params.vertexStride * index + params.posOffset);
+      (info.vertices + info.vertexStride * index + info.positionOffset);
     return *p;
 }
 
-static float3 TraceColor
-  (primitive_acceleration_structure accel,
-   constant TraceParams& params,
-   device const uchar* vertices,
-   device const uchar* indices,
-   float2 ndc)
+// Flat-shaded world-space geometric normal of the hit triangle, oriented
+// toward the ray origin.
+static float3 HitNormal
+  (constant InstanceInfo& info, uint prim, float3 rayDirection)
 {
+    uint3 tri = LoadTriangleIndices(info, prim);
+    float3 p0 = LoadPosition(info, tri.x);
+    float3 p1 = LoadPosition(info, tri.y);
+    float3 p2 = LoadPosition(info, tri.z);
+    float3 n = cross(p1 - p0, p2 - p0); // object space
+    n = float3(dot(info.normalMatrix0.xyz, n),
+               dot(info.normalMatrix1.xyz, n),
+               dot(info.normalMatrix2.xyz, n));
+    n = normalize(n);
+    return dot(n, rayDirection) > 0 ? -n : n;
+}
+
+kernel void TraceImageTexture
+  (instance_acceleration_structure accel [[buffer(0)]],
+   constant TraceParams& params [[buffer(1)]],
+   constant InstanceInfo* instances [[buffer(2)]],
+   texture2d<float, access::write> output [[texture(0)]],
+   uint2 id [[thread_position_in_grid]])
+{
+    if (id.x >= params.width || id.y >= params.height) return;
+
+    float2 ndc = float2(id) / float2(params.width, params.height) * 2 - 1;
     ray r = GenerateRay(params, ndc);
 
-    intersector<triangle_data> isect;
-    intersection_result<triangle_data> hit = isect.intersect(r, accel);
+    intersector<triangle_data, instancing> isect;
+    intersection_result<triangle_data, instancing> hit =
+      isect.intersect(r, accel, 0xffu);
 
-    if (hit.type != intersection_type::triangle)
-        return float3(0.1, 0.1, 0.2); // background
+    float3 color = float3(0.1, 0.1, 0.2); // background
 
-    uint3 tri = LoadTriangleIndices(params, indices, hit.primitive_id);
-    float3 p0 = LoadPosition(params, vertices, tri.x);
-    float3 p1 = LoadPosition(params, vertices, tri.y);
-    float3 p2 = LoadPosition(params, vertices, tri.z);
-    float3 n = normalize(cross(p1 - p0, p2 - p0));
-    if (dot(n, r.direction) > 0) n = -n; // face the ray origin
-    return n * 0.5 + 0.5;
-}
+    if (hit.type == intersection_type::triangle)
+    {
+        constant InstanceInfo& info = instances[hit.instance_id];
+        float3 n = HitNormal(info, hit.primitive_id, r.direction);
+        color = n * 0.5 + 0.5;
+    }
 
-kernel void TraceImage
-  (primitive_acceleration_structure accel [[buffer(0)]],
-   constant TraceParams& params [[buffer(1)]],
-   device uchar4* output [[buffer(2)]],
-   device const uchar* vertices [[buffer(3)]],
-   device const uchar* indices [[buffer(4)]],
-   uint2 id [[thread_position_in_grid]])
-{
-    if (id.x >= params.width || id.y >= params.height) return;
-
-    float2 ndc = float2(id) / float2(params.width, params.height) * 2 - 1;
-    float3 color = TraceColor(accel, params, vertices, indices, ndc);
-    output[id.y * params.width + id.x] =
-      uchar4(uchar3(saturate(color) * 255), 255);
-}
-
-// Writes into a Unity RenderTexture. GUI.DrawTexture and ReadPixels both
-// treat row 0 as the bottom of the image (same convention as Texture2D), so
-// no vertical flip is applied here.
-kernel void TraceImageTexture
-  (primitive_acceleration_structure accel [[buffer(0)]],
-   constant TraceParams& params [[buffer(1)]],
-   texture2d<float, access::write> output [[texture(0)]],
-   device const uchar* vertices [[buffer(3)]],
-   device const uchar* indices [[buffer(4)]],
-   uint2 id [[thread_position_in_grid]])
-{
-    if (id.x >= params.width || id.y >= params.height) return;
-
-    float2 ndc = float2(id) / float2(params.width, params.height) * 2 - 1;
-    float3 color = TraceColor(accel, params, vertices, indices, ndc);
     output.write(float4(saturate(color), 1), id);
 }
 
-// Probe rays are given explicitly in object space as (origin, direction)
+// Probe rays are given explicitly in world space as (origin, direction)
 // float4 pairs, so results can be checked against analytically derived
 // expectations on the CPU side.
 kernel void TraceProbes
-  (primitive_acceleration_structure accel [[buffer(0)]],
+  (instance_acceleration_structure accel [[buffer(0)]],
    constant TraceParams& params [[buffer(1)]],
    device ProbeResult* output [[buffer(2)]],
-   constant float4* rays [[buffer(3)]],
+   constant InstanceInfo* instances [[buffer(3)]],
+   constant float4* rays [[buffer(4)]],
    uint id [[thread_position_in_grid]])
 {
     ray r;
@@ -186,8 +206,9 @@ kernel void TraceProbes
     r.min_distance = 0;
     r.max_distance = INFINITY;
 
-    intersector<triangle_data> isect;
-    intersection_result<triangle_data> hit = isect.intersect(r, accel);
+    intersector<triangle_data, instancing> isect;
+    intersection_result<triangle_data, instancing> hit =
+      isect.intersect(r, accel, 0xffu);
 
     ProbeResult res = {};
     if (hit.type == intersection_type::triangle)
@@ -195,6 +216,7 @@ kernel void TraceProbes
         res.hit = 1;
         res.distance = hit.distance;
         res.primitiveIndex = hit.primitive_id;
+        res.instanceIndex = hit.instance_id;
         res.barycentric = hit.triangle_barycentric_coord;
     }
     output[id] = res;
@@ -249,8 +271,7 @@ id<MTLComputePipelineState> CreatePipeline(id<MTLLibrary> library,
 
 bool EnsurePipelines()
 {
-    if (s_ImagePipeline != nil && s_TexturePipeline != nil &&
-        s_ProbePipeline != nil) return true;
+    if (s_TexturePipeline != nil && s_ProbePipeline != nil) return true;
 
     NSError* error = nil;
     id<MTLLibrary> library =
@@ -264,11 +285,9 @@ bool EnsurePipelines()
         return false;
     }
 
-    s_ImagePipeline = CreatePipeline(library, @"TraceImage");
     s_TexturePipeline = CreatePipeline(library, @"TraceImageTexture");
     s_ProbePipeline = CreatePipeline(library, @"TraceProbes");
-    return s_ImagePipeline != nil && s_TexturePipeline != nil &&
-           s_ProbePipeline != nil;
+    return s_TexturePipeline != nil && s_ProbePipeline != nil;
 }
 
 bool RunCommandBuffer(id<MTLCommandBuffer> command)
@@ -284,20 +303,60 @@ bool RunCommandBuffer(id<MTLCommandBuffer> command)
     return true;
 }
 
+id<MTLAccelerationStructure> BuildAccelerationStructure
+  (MTLAccelerationStructureDescriptor* descriptor)
+{
+    MTLAccelerationStructureSizes sizes =
+      [s_Device accelerationStructureSizesWithDescriptor:descriptor];
+
+    id<MTLAccelerationStructure> accel =
+      [s_Device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+    id<MTLBuffer> scratch =
+      [s_Device newBufferWithLength:sizes.buildScratchBufferSize
+                            options:MTLResourceStorageModePrivate];
+    if (accel == nil || scratch == nil)
+    {
+        SetError(@"Acceleration structure allocation failed.");
+        return nil;
+    }
+
+    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
+    id<MTLAccelerationStructureCommandEncoder> encoder =
+      [command accelerationStructureCommandEncoder];
+    [encoder buildAccelerationStructure:accel
+                             descriptor:descriptor
+                          scratchBuffer:scratch
+                    scratchBufferOffset:0];
+    [encoder endEncoding];
+
+    return RunCommandBuffer(command) ? accel : nil;
+}
+
+// Marks all indirectly referenced resources (BLASes and bindlessly accessed
+// mesh buffers) resident for the dispatch.
+void UseMeshResources(id<MTLComputeCommandEncoder> encoder)
+{
+    for (const auto& mesh : s_Meshes)
+    {
+        [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
+        [encoder useResource:mesh.vertexBuffer usage:MTLResourceUsageRead];
+        [encoder useResource:mesh.indexBuffer usage:MTLResourceUsageRead];
+    }
+}
+
 bool DispatchTrace(id<MTLComputePipelineState> pipeline,
                    const TraceParams* params,
-                   id<MTLBuffer> outputBuffer,
-                   void (^bindExtra)(id<MTLComputeCommandEncoder>),
+                   void (^bind)(id<MTLComputeCommandEncoder>),
                    MTLSize grid, MTLSize group)
 {
     id<MTLCommandBuffer> command = [s_Queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
 
     [encoder setComputePipelineState:pipeline];
-    [encoder setAccelerationStructure:s_Accel atBufferIndex:0];
+    [encoder setAccelerationStructure:s_InstanceAS atBufferIndex:0];
     [encoder setBytes:params length:sizeof(TraceParams) atIndex:1];
-    [encoder setBuffer:outputBuffer offset:0 atIndex:2];
-    bindExtra(encoder);
+    UseMeshResources(encoder);
+    bind(encoder);
     [encoder dispatchThreads:grid threadsPerThreadgroup:group];
     [encoder endEncoding];
 
@@ -333,8 +392,10 @@ MetalRT_DeviceSupportsRaytracing()
     return s_Device.supportsRaytracing ? 1 : 0;
 }
 
+// Registers a mesh and builds its BLAS. Returns the mesh index (>= 0) on
+// success or a negative error code.
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
-MetalRT_BuildAccelerationStructure
+MetalRT_AddMesh
   (void* vertexBuffer, uint32_t vertexStride, uint32_t positionOffset,
    void* indexBuffer, uint32_t indexFormat, uint32_t indexByteOffset,
    uint32_t triangleCount)
@@ -347,16 +408,20 @@ MetalRT_BuildAccelerationStructure
         return -2;
     }
 
-    s_VertexBuffer = (__bridge id<MTLBuffer>)vertexBuffer;
-    s_IndexBuffer = (__bridge id<MTLBuffer>)indexBuffer;
+    MeshEntry mesh = {};
+    mesh.vertexBuffer = (__bridge id<MTLBuffer>)vertexBuffer;
+    mesh.indexBuffer = (__bridge id<MTLBuffer>)indexBuffer;
+    mesh.vertexStride = vertexStride;
+    mesh.positionOffset = positionOffset;
+    mesh.indexFormat = indexFormat;
 
     MTLAccelerationStructureTriangleGeometryDescriptor* geometry =
       [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-    geometry.vertexBuffer = s_VertexBuffer;
+    geometry.vertexBuffer = mesh.vertexBuffer;
     geometry.vertexBufferOffset = positionOffset;
     geometry.vertexStride = vertexStride;
     geometry.vertexFormat = MTLAttributeFormatFloat3;
-    geometry.indexBuffer = s_IndexBuffer;
+    geometry.indexBuffer = mesh.indexBuffer;
     geometry.indexBufferOffset = indexByteOffset;
     geometry.indexType =
       indexFormat == 0 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
@@ -367,56 +432,84 @@ MetalRT_BuildAccelerationStructure
       [MTLPrimitiveAccelerationStructureDescriptor descriptor];
     descriptor.geometryDescriptors = @[geometry];
 
-    MTLAccelerationStructureSizes sizes =
-      [s_Device accelerationStructureSizesWithDescriptor:descriptor];
+    mesh.blas = BuildAccelerationStructure(descriptor);
+    if (mesh.blas == nil) return -3;
 
-    s_Accel =
-      [s_Device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
-    id<MTLBuffer> scratch =
-      [s_Device newBufferWithLength:sizes.buildScratchBufferSize
-                            options:MTLResourceStorageModePrivate];
-    if (s_Accel == nil || scratch == nil)
-    {
-        SetError(@"Acceleration structure allocation failed.");
-        return -3;
-    }
-
-    id<MTLCommandBuffer> command = [s_Queue commandBuffer];
-    id<MTLAccelerationStructureCommandEncoder> encoder =
-      [command accelerationStructureCommandEncoder];
-    [encoder buildAccelerationStructure:s_Accel
-                             descriptor:descriptor
-                          scratchBuffer:scratch
-                    scratchBufferOffset:0];
-    [encoder endEncoding];
-
-    return RunCommandBuffer(command) ? 0 : -4;
+    s_Meshes.push_back(mesh);
+    return (int)s_Meshes.size() - 1;
 }
 
+// (Re)builds the instance acceleration structure (TLAS) and the shader-side
+// per-instance records. Cheap enough to call every frame with updated
+// transforms.
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
-MetalRT_TraceImage(const TraceParams* params, void* outputPixels)
+MetalRT_BuildInstanceAS(const InstanceDesc* instances, int32_t count)
 {
-    if (s_Accel == nil)
+    if (!EnsureDevice()) return -1;
+
+    if (s_Meshes.empty() || count <= 0)
     {
-        SetError(@"Acceleration structure has not been built.");
-        return -1;
+        SetError(@"No meshes registered or empty instance list.");
+        return -2;
     }
-    if (!EnsurePipelines()) return -2;
 
-    NSUInteger size = params->width * params->height * 4;
-    id<MTLBuffer> output =
-      [s_Device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    id<MTLBuffer> descBuffer = [s_Device
+      newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor)
+                          * count
+                  options:MTLResourceStorageModeShared];
+    id<MTLBuffer> infoBuffer = [s_Device
+      newBufferWithLength:sizeof(GpuInstanceInfo) * count
+                  options:MTLResourceStorageModeShared];
 
-    bool ok = DispatchTrace(
-      s_ImagePipeline, params, output,
-      ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBuffer:s_VertexBuffer offset:0 atIndex:3];
-          [encoder setBuffer:s_IndexBuffer offset:0 atIndex:4];
-      },
-      MTLSizeMake(params->width, params->height, 1), MTLSizeMake(8, 8, 1));
-    if (!ok) return -3;
+    auto* descs = (MTLAccelerationStructureInstanceDescriptor*)
+      descBuffer.contents;
+    auto* infos = (GpuInstanceInfo*)infoBuffer.contents;
 
-    std::memcpy(outputPixels, output.contents, size);
+    for (int32_t i = 0; i < count; i++)
+    {
+        const InstanceDesc& src = instances[i];
+        if (src.meshIndex < 0 || src.meshIndex >= (int32_t)s_Meshes.size())
+        {
+            SetError(@"Instance references an invalid mesh index.");
+            return -3;
+        }
+        const MeshEntry& mesh = s_Meshes[src.meshIndex];
+
+        MTLAccelerationStructureInstanceDescriptor& desc = descs[i];
+        for (int c = 0; c < 4; c++)
+            desc.transformationMatrix.columns[c] =
+              MTLPackedFloat3Make(src.objectToWorld[0][c],
+                                  src.objectToWorld[1][c],
+                                  src.objectToWorld[2][c]);
+        desc.options = MTLAccelerationStructureInstanceOptionOpaque;
+        desc.mask = 0xff;
+        desc.intersectionFunctionTableOffset = 0;
+        desc.accelerationStructureIndex = src.meshIndex;
+
+        GpuInstanceInfo& info = infos[i];
+        info.vertices = mesh.vertexBuffer.gpuAddress;
+        info.indices = mesh.indexBuffer.gpuAddress;
+        info.vertexStride = mesh.vertexStride;
+        info.positionOffset = mesh.positionOffset;
+        info.indexFormat = mesh.indexFormat;
+        info.pad = 0;
+        std::memcpy(info.normalMatrix, src.normalMatrix,
+                    sizeof(info.normalMatrix));
+    }
+
+    NSMutableArray* blases = [NSMutableArray arrayWithCapacity:s_Meshes.size()];
+    for (const auto& mesh : s_Meshes) [blases addObject:mesh.blas];
+
+    MTLInstanceAccelerationStructureDescriptor* descriptor =
+      [MTLInstanceAccelerationStructureDescriptor descriptor];
+    descriptor.instancedAccelerationStructures = blases;
+    descriptor.instanceCount = count;
+    descriptor.instanceDescriptorBuffer = descBuffer;
+
+    s_InstanceAS = BuildAccelerationStructure(descriptor);
+    if (s_InstanceAS == nil) return -4;
+
+    s_InstanceInfo = infoBuffer;
     return 0;
 }
 
@@ -427,9 +520,9 @@ MetalRT_TraceImage(const TraceParams* params, void* outputPixels)
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_TraceToTexture(const TraceParams* params, void* texturePtr)
 {
-    if (s_Accel == nil)
+    if (s_InstanceAS == nil)
     {
-        SetError(@"Acceleration structure has not been built.");
+        SetError(@"Instance acceleration structure has not been built.");
         return -1;
     }
     if (!EnsurePipelines()) return -2;
@@ -442,24 +535,23 @@ MetalRT_TraceToTexture(const TraceParams* params, void* texturePtr)
     }
 
     bool ok = DispatchTrace(
-      s_TexturePipeline, params, nil,
+      s_TexturePipeline, params,
       ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:s_InstanceInfo offset:0 atIndex:2];
           [encoder setTexture:texture atIndex:0];
-          [encoder setBuffer:s_VertexBuffer offset:0 atIndex:3];
-          [encoder setBuffer:s_IndexBuffer offset:0 atIndex:4];
       },
       MTLSizeMake(params->width, params->height, 1), MTLSizeMake(8, 8, 1));
     return ok ? 0 : -4;
 }
 
-// rays: (origin.xyzw, direction.xyzw) float4 pairs in object space
+// rays: (origin.xyzw, direction.xyzw) float4 pairs in world space
 int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_TraceProbes(const TraceParams* params,
                     const float* rays, int32_t count, ProbeResult* results)
 {
-    if (s_Accel == nil)
+    if (s_InstanceAS == nil)
     {
-        SetError(@"Acceleration structure has not been built.");
+        SetError(@"Instance acceleration structure has not been built.");
         return -1;
     }
     if (!EnsurePipelines()) return -2;
@@ -469,9 +561,11 @@ MetalRT_TraceProbes(const TraceParams* params,
       [s_Device newBufferWithLength:size options:MTLResourceStorageModeShared];
 
     bool ok = DispatchTrace(
-      s_ProbePipeline, params, output,
+      s_ProbePipeline, params,
       ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBytes:rays length:sizeof(float) * 8 * count atIndex:3];
+          [encoder setBuffer:output offset:0 atIndex:2];
+          [encoder setBuffer:s_InstanceInfo offset:0 atIndex:3];
+          [encoder setBytes:rays length:sizeof(float) * 8 * count atIndex:4];
       },
       MTLSizeMake(count, 1, 1), MTLSizeMake(1, 1, 1));
     if (!ok) return -3;
@@ -482,9 +576,9 @@ MetalRT_TraceProbes(const TraceParams* params,
 
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
 {
-    s_Accel = nil;
-    s_VertexBuffer = nil;
-    s_IndexBuffer = nil;
+    s_InstanceAS = nil;
+    s_InstanceInfo = nil;
+    s_Meshes.clear();
 }
 
 } // extern "C"

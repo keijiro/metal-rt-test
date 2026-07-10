@@ -5,11 +5,12 @@ HDRP-path-tracing-like feature for URP.
 
 ![comparison](Images/comparison.png)
 
-*Left: URP real-time rasterization. Right: the Metal RT path tracer. The
-checkerboard floor uses a Shader Graph: URP rasterizes it with the graph's
-own shader while the path tracer evaluates a compute shader automatically
-generated from the same graph — both views match. The path traced view adds
-soft shadows, GI color bleeding, emissive lighting, and mirror reflections.*
+*Left: URP real-time rasterization. Right: the same view path traced by a
+URP camera whose renderer has `MetalRTPathTracerFeature`. The checkerboard
+floor uses a Shader Graph: URP rasterizes it with the graph's own shader
+while the path tracer evaluates a compute shader automatically generated
+from the same graph — both views match. The path traced view adds soft
+shadows, GI color bleeding, emissive lighting, and mirror reflections.*
 
 ## Overview
 
@@ -17,10 +18,12 @@ This project verifies, step by step, that hardware ray tracing on macOS
 (Apple Silicon) can cooperate with Unity — starting from building
 acceleration structures out of non-readable Unity meshes, through a
 progressive path tracer that consumes real URP/Lit materials inside Unity's
-own Metal command stream, and now including **conditional Shader Graph
-support**: material evaluation runs as Unity-compiled compute shaders
-interleaved with the native ray tracing kernels (wavefront style), and those
-compute shaders can be generated automatically from Shader Graph assets.
+own Metal command stream, **conditional Shader Graph support** (material
+evaluation as Unity-compiled compute shaders, generatable from Shader Graph
+assets), and now **full URP integration**: the path tracer runs as a
+`ScriptableRendererFeature` — add the feature to a URP renderer and any
+camera using it gets path traced output, recorded through a RenderGraph
+unsafe pass and composited onto the camera color target.
 
 ## Background
 
@@ -79,16 +82,25 @@ project.
   sampling macros are redefined to their LOD variants for compute. Graphs
   requiring unsupported inputs (screen position, scene color/depth, etc.)
   are rejected — this is the "conditional" support boundary.
+- `Assets/Scripts/MetalRTPathTracer.cs` +
+  `Assets/Scripts/MetalRTPathTracerFeature.cs` — The URP integration. The
+  runtime core owns the progressive result texture, the shared wavefront
+  buffers, and the material evaluation compute list, and records the phase
+  pipeline into a command buffer. The renderer feature drives it from a
+  RenderGraph **unsafe pass** (the same escape hatch DLSS/FSR2-style native
+  integrations use): `CommandBufferHelpers.GetNativeCommandBuffer` provides
+  the raw command buffer for `IssuePluginEventAndData` and the material
+  dispatches, then the result is blitted onto the camera color target.
+  Accumulation restarts automatically when the camera moves.
 - `Assets/Scripts/PathTracerTest.cs` — The test harness. It builds a static
-  URP scene at runtime; the floor uses `Assets/Shaders/TestGraph.shadergraph`
-  (a texture-mapped Lit graph) rasterized by URP on the left and evaluated
-  by its generated compute shader in the path tracer on the right. Material
-  properties are bound to the generated compute generically from the
-  shader's property list. A hand-written SurfaceDescription-style compute
-  (`TestProcedural.compute`) drives the small torus as a second material
-  evaluator. The path traced result is displayed through URP itself (a
-  second camera rendering a fullscreen quad) so both halves share the same
-  color pipeline.
+  URP scene at runtime; the left camera rasterizes it normally while the
+  right camera uses the renderer with the path tracer feature. The floor
+  uses `Assets/Shaders/TestGraph.shadergraph` (a texture-mapped Lit graph)
+  rasterized by URP on the left and evaluated by its generated compute
+  shader in the path tracer on the right. Material properties are bound to
+  the generated compute generically from the shader's property list. A
+  hand-written SurfaceDescription-style compute (`TestProcedural.compute`)
+  drives the small torus as a second material evaluator.
 - `Assets/Scripts/MetalRTPlugin.cs` — P/Invoke interop and the event data
   blob writer (a small ring of unmanaged blobs passes per-frame camera,
   lighting, and instance transforms to the render thread).
@@ -112,8 +124,14 @@ Analytic tests (logged as PASS/FAIL to the console on play):
   error: **0.00 %** (validates the wavefront interop end to end).
 - **T4 Shader Graph generated material**: the compute shader generated from
   `TestGraph.shadergraph` evaluates the floor and must match the
-  C#-replicated base map sample times tint — and agree with T1's native
-  evaluation of the same material. Measured relative error: **0.03 %**.
+  C#-replicated base map sample times tint. The tint is changed for the
+  test only — the generated compute reads material properties live while
+  the native fallback keeps its setup snapshot, so the test passes only
+  when the generated kernel really runs. Measured relative error:
+  **0.48 %**.
+
+All of the above run through the URP renderer feature (RenderGraph unsafe
+pass), not a standalone dispatch path.
 
 Visual verification: matching composition and shadow directions against the
 URP raster reference, the Shader Graph floor matching between the raster
@@ -134,8 +152,9 @@ after rebuilding the plugin.
 
 ## Roadmap
 
-- **URP plumbing**: drive the render events from a `ScriptableRenderPass`
-  (RenderGraph) and consume URP cameras and render targets directly.
 - **Robustness**: broaden the supported Shader Graph input set (multiple
   UV channels, vertex color), automate generation on graph import, handle
   alpha clipping (non-opaque intersection), and support keyword variants.
+- **Scene integration**: register scene meshes/materials automatically
+  (renderer component scan) instead of the hand-built test scene, support
+  more lights (point/spot/area), and denoise the progressive output.

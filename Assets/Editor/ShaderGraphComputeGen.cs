@@ -144,6 +144,7 @@ public static class ShaderGraphComputeGen
 
 #include ""Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl""
 #include ""Packages/com.unity.render-pipelines.core/ShaderLibrary/Texture.hlsl""
+#include ""Packages/com.unity.shadergraph/ShaderGraphLibrary/Functions.hlsl""
 
 // Compute shaders have no derivatives; force LOD 0 sampling for the graph
 // code, which accesses textures through these macros.

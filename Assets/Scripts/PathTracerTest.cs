@@ -1,19 +1,19 @@
 using System;
 using System.Collections;
 using System.IO;
-using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using static MetalRTTest.MetalRTPlugin;
 
 namespace MetalRTTest {
 
-// Test harness for the Metal hardware ray tracing path tracer (stage 1:
-// URP Lit materials only). Builds a static URP scene at runtime, registers
-// its meshes and materials with the native plugin, runs analytic
-// verification passes (probe rays, direct lighting, furnace test), then
-// path-traces progressively on the render thread. Shows the URP rasterized
-// view (left) and the path traced result (right) side by side.
+// Test harness for the Metal RT path tracer. Builds a static URP scene at
+// runtime, registers its meshes and materials with the native plugin, and
+// runs analytic verification passes. Rendering happens through URP itself:
+// the left camera rasterizes the scene normally, while the right camera
+// uses a renderer with MetalRTPathTracerFeature, which replaces its output
+// with the path traced image.
 public sealed class PathTracerTest : MonoBehaviour
 {
     // Scene bootstrap
@@ -28,62 +28,23 @@ public sealed class PathTracerTest : MonoBehaviour
     static readonly (Vector3 origin, Vector3 dir,
                      bool hit, float dist, int instance)[] Probes =
     {
-        // inner tube wall of the big torus (center y 0.4)
         (new Vector3(0, 0.4f, 0), Vector3.right, true, 0.6f, 1),
-        // through the torus hole down to the floor
         (new Vector3(0, 5, 0), Vector3.down, true, 5.0f, 0),
-        // top of the metal sphere (center y 0.6 + radius 0.6)
         (new Vector3(2.2f, 5, 0.5f), Vector3.down, true, 3.8f, 2),
-        // pointing away from everything
         (new Vector3(0, 1, -6), Vector3.back, false, 0, 0),
-        // outer wall of the big torus
         (new Vector3(-5, 0.4f, 0), Vector3.right, true, 3.6f, 1),
     };
 
     const float ProbeTolerance = 0.02f;
 
-    // Furnace test sphere, far above the scene (URP culls it; only the
-    // virtual path tracer camera looks at it).
+    // Furnace test sphere, far above the scene (only the analytic tests'
+    // virtual camera looks at it).
     static readonly Vector3 FurnaceCenter = new Vector3(0, 50, 0);
     const float FurnaceScale = 2; // base radius 0.5 -> radius 1
 
-    const int TestFrames = 32;      // accumulation frames per analytic test
-    const int SaveFrame = 300;      // progressive frame to save the PNG at
+    const int TestFrames = 32;   // accumulation frames per analytic test
+    const int SaveFrame = 300;   // progressive frame to save the PNG at
     const uint ProductionBounces = 5;
-
-    // Private members
-
-    // A material evaluated by a Unity-compiled compute shader instead of
-    // the native default URP Lit evaluation (the Shader Graph path).
-    sealed class MaterialCompute
-    {
-        public ComputeShader Shader;
-        public int Kernel;
-        public int MaterialIndex;
-        public bool Enabled = true;
-        public Action<CommandBuffer> Bind;
-    }
-
-    Camera _camera;
-    Light _light;
-    (int mesh, int material, Transform transform)[] _instances;
-    Mesh[] _meshes = new Mesh[0];
-    Material[] _materials;
-    RenderTexture _result;
-    IntPtr _resultPtr;
-    GraphicsBuffer _hitBuffer, _attrBuffer, _surfBuffer;
-    readonly System.Collections.Generic.List<MaterialCompute>
-      _materialComputes = new();
-    MaterialCompute _procedural;
-    CommandBuffer _traceCommands;
-    IntPtr _eventFunc;
-    IntPtr[] _eventData;
-    int _eventSlot;
-    uint _frameIndex;
-    int _tracedFrames;
-    bool _resetQueued = true;
-    TraceParams? _cameraOverride;
-    FrameSettings _settings;
 
     // Procedural test material parameters (linear colors)
     static readonly Color ProcColorA = new Color(0.9f, 0.25f, 0.1f);
@@ -91,7 +52,18 @@ public sealed class PathTracerTest : MonoBehaviour
     const float ProcCheckerScale = 6;
     const int ProceduralTargetMaterial = 3; // white torus
 
-    const int EventRingSize = 4;
+    // Private members
+
+    Camera _camera;   // left half: URP raster reference
+    Camera _ptCamera; // right half: URP camera with the path tracer feature
+    Light _light;
+    (int mesh, int material, Transform transform)[] _instances;
+    Mesh[] _meshes = new Mesh[0];
+    Material[] _materials;
+    MetalRTPathTracer.MaterialCompute _procedural;
+    int _tracedFrames;
+
+    static MetalRTPathTracer Tracer => MetalRTPathTracer.Instance;
 
     static void Log(string message) => Debug.Log("[MetalRT] " + message);
 
@@ -110,70 +82,31 @@ public sealed class PathTracerTest : MonoBehaviour
         if (!SetUpMaterials()) return;
         if (!BuildInstanceAS()) return;
         RunProbeTest();
-        SetUpRenderTarget();
-        SetUpResultView();
+        if (!SetUpTracer()) return;
         StartCoroutine(RunTestSequence());
     }
 
     void Update()
     {
-        if (_result == null) return;
-        TraceFrame();
+        if (Tracer.IsConfigured) _tracedFrames++;
     }
 
     void OnDestroy()
     {
+        Tracer.Dispose();
         MetalRT_Dispose();
-        _traceCommands?.Dispose();
-        _hitBuffer?.Dispose();
-        _attrBuffer?.Dispose();
-        _surfBuffer?.Dispose();
-        if (_eventData != null)
-            foreach (var ptr in _eventData) Marshal.FreeHGlobal(ptr);
     }
 
     void OnGUI()
     {
-        if (_result == null) return;
+        if (!Tracer.IsConfigured) return;
         GUI.Label(new Rect(10, 10, 300, 20), "URP Raster (reference)");
         GUI.Label(new Rect(Screen.width / 2 + 10, 10, 380, 20),
-                  $"Metal RT Path Tracer ({_tracedFrames} frames)");
+                  "Metal RT Path Tracer via RendererFeature " +
+                  $"({_tracedFrames} frames)");
     }
 
-    // Shows the linear result texture through URP itself (a second camera
-    // rendering a full screen quad on the right half), so the color
-    // conversion at display time is exactly the same as the raster
-    // reference on the left half.
-    void SetUpResultView()
-    {
-        const int layer = 31;
-
-        var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        quad.name = "Result View";
-        quad.layer = layer;
-        quad.transform.position = new Vector3(1000, 0, 1); // out of the scene
-        quad.transform.localScale = new Vector3(2 * _camera.aspect, 2, 1);
-        Destroy(quad.GetComponent<Collider>());
-
-        var mat = new Material(Shader.Find("Universal Render Pipeline/Unlit"));
-        mat.SetTexture("_BaseMap", _result);
-        quad.GetComponent<MeshRenderer>().sharedMaterial = mat;
-
-        var view = new GameObject("Result Camera", typeof(Camera))
-                     .GetComponent<Camera>();
-        view.transform.position = new Vector3(1000, 0, 0);
-        view.orthographic = true;
-        view.orthographicSize = 1;
-        view.cullingMask = 1 << layer;
-        view.rect = new Rect(0.5f, 0, 0.5f, 1); // right half
-        view.clearFlags = CameraClearFlags.SolidColor;
-        view.backgroundColor = Color.black;
-
-        _camera.cullingMask &= ~(1 << layer);
-    }
-
-    // Test scene construction: a static arrangement of URP/Lit materials
-    // on a floor, lit by one directional light and a flat ambient.
+    // Test scene construction
 
     bool SetUpScene()
     {
@@ -233,11 +166,22 @@ public sealed class PathTracerTest : MonoBehaviour
         _camera.transform.position = new Vector3(3.0f, 2.8f, -5.6f);
         _camera.transform.LookAt(new Vector3(0, 0.3f, 0));
         _camera.fieldOfView = 45;
-        _camera.rect = new Rect(0, 0, 0.5f, 1); // left half: raster reference
+        _camera.rect = new Rect(0, 0, 0.5f, 1); // left half
         _camera.clearFlags = CameraClearFlags.SolidColor;
         _camera.backgroundColor = RenderSettings.ambientLight;
 
-        _settings = ProductionSettings();
+        // Right half: same view, rendered by the path tracer feature
+        // (renderer index 1). The raster pass is skipped via culling mask.
+        _ptCamera = new GameObject("PT Camera", typeof(Camera))
+                      .GetComponent<Camera>();
+        _ptCamera.transform.SetPositionAndRotation
+          (_camera.transform.position, _camera.transform.rotation);
+        _ptCamera.fieldOfView = _camera.fieldOfView;
+        _ptCamera.rect = new Rect(0.5f, 0, 0.5f, 1);
+        _ptCamera.cullingMask = 0;
+        _ptCamera.clearFlags = CameraClearFlags.SolidColor;
+        _ptCamera.backgroundColor = Color.black;
+        _ptCamera.GetUniversalAdditionalCameraData().SetRenderer(1);
         return true;
     }
 
@@ -246,8 +190,7 @@ public sealed class PathTracerTest : MonoBehaviour
         envColor = RenderSettings.ambientLight.linear,
         lightDir = _light.transform.forward,
         // Unity's punctual light convention folds 1/pi into the Lambert
-        // term (diffuse = albedo * light * cos), so premultiply by pi for
-        // the physically normalized BRDF used by the path tracer.
+        // term, so premultiply by pi for the physically normalized BRDF.
         lightColor = _light.color.linear * (_light.intensity * Mathf.PI),
         maxBounces = ProductionBounces,
         exposure = 1
@@ -327,8 +270,6 @@ public sealed class PathTracerTest : MonoBehaviour
             return -1;
         }
 
-        // Normal/tangent/UV must live in the same vertex stream as position
-        // for the single-buffer fetch in the shader.
         var normalOffset = AttributeOffset(mesh, VertexAttribute.Normal,
                                            posStream, 3);
         var tangentOffset = AttributeOffset(mesh, VertexAttribute.Tangent,
@@ -341,8 +282,6 @@ public sealed class PathTracerTest : MonoBehaviour
         var is16Bit = mesh.indexFormat == IndexFormat.UInt16;
         var indexSize = is16Bit ? 2u : 4u;
 
-        // Native buffer pointers are only guaranteed valid within this
-        // frame, so the BLAS is built right away (synchronously).
         var ret = MetalRT_AddMesh
           (mesh.GetNativeVertexBufferPtr(posStream), (uint)stride,
            (uint)posOffset, normalOffset, tangentOffset, uvOffset,
@@ -356,8 +295,7 @@ public sealed class PathTracerTest : MonoBehaviour
         }
 
         Log($"BLAS #{ret} built from non-readable mesh {resourceName} " +
-            $"({indexCount / 3} triangles, normal@{normalOffset}, " +
-            $"uv@{uvOffset}): OK");
+            $"({indexCount / 3} triangles): OK");
 
         Array.Resize(ref _meshes, ret + 1);
         _meshes[ret] = mesh;
@@ -382,9 +320,6 @@ public sealed class PathTracerTest : MonoBehaviour
         var descs = new MaterialDesc[_materials.Length];
         for (var i = 0; i < _materials.Length; i++)
         {
-            // Materials with non-Lit shaders (Shader Graph) may lack some
-            // of these properties; their surface records get overwritten by
-            // their material evaluation compute shaders anyway.
             var mat = _materials[i];
             var tex = mat.HasProperty("_BaseMap") ?
               mat.GetTexture("_BaseMap") as Texture2D : null;
@@ -504,83 +439,57 @@ public sealed class PathTracerTest : MonoBehaviour
             (passed == Probes.Length ? " -- ALL PASS" : " -- FAILURE"));
     }
 
-    // Per-frame trace on the render thread via IssuePluginEventAndData
+    // Tracer configuration (buffers, material evaluation computes)
 
-    void SetUpRenderTarget()
+    bool SetUpTracer()
     {
-        var (w, h) = (_camera.pixelWidth, _camera.pixelHeight);
-        _result = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat)
-          { enableRandomWrite = true };
-        _result.Create();
-        _resultPtr = _result.GetNativeTexturePtr();
-        Log($"RenderTexture ({w}x{h}, ARGBFloat) created; native ptr acquired");
-
-        // Wavefront buffers shared between the native kernels and Unity
-        // compute shaders (material evaluation).
-        _hitBuffer = new GraphicsBuffer
-          (GraphicsBuffer.Target.Structured, w * h, HitRecordStride);
-        _attrBuffer = new GraphicsBuffer
-          (GraphicsBuffer.Target.Structured, w * h, HitAttributesStride);
-        _surfBuffer = new GraphicsBuffer
-          (GraphicsBuffer.Target.Structured, w * h, SurfaceRecordStride);
-        var ret = MetalRT_SetSharedBuffers(_hitBuffer.GetNativeBufferPtr(),
-                                           _attrBuffer.GetNativeBufferPtr(),
-                                           _surfBuffer.GetNativeBufferPtr());
-        Log($"Shared wavefront buffers registered (ret={ret}): " +
-            (ret == 0 ? "OK" : $"FAIL: {LastError}"));
-
-        _eventFunc = MetalRT_GetRenderEventFunc();
-        _traceCommands = new CommandBuffer { name = "MetalRT Trace" };
-
-        // A small ring of unmanaged blobs so the render thread never reads
-        // a blob the main thread is currently rewriting.
-        _eventData = new IntPtr[EventRingSize];
-        for (var i = 0; i < EventRingSize; i++)
-            _eventData[i] = Marshal.AllocHGlobal(EventDataSize);
-
-        SetUpProceduralMaterial();
-    }
-
-    // Registers the hand-written SurfaceDescription-style compute shader as
-    // the material evaluator for the white torus (stage 2a validation).
-    void SetUpProceduralMaterial()
-    {
-        var cs = Resources.Load<ComputeShader>("TestProcedural");
-        _procedural = new MaterialCompute
+        Tracer.Configure(MakeInstanceDescs);
+        Tracer.Settings = ProductionSettings();
+        if (!Tracer.EnsureResources(_ptCamera.pixelWidth,
+                                    _ptCamera.pixelHeight))
         {
-            Shader = cs,
-            Kernel = cs.FindKernel("EvaluateMaterial"),
+            Log("FAIL: tracer resource setup");
+            return false;
+        }
+        Log($"Tracer configured ({_ptCamera.pixelWidth}x" +
+            $"{_ptCamera.pixelHeight}); driven by the URP renderer feature");
+
+        var procCs = Resources.Load<ComputeShader>("TestProcedural");
+        _procedural = new MetalRTPathTracer.MaterialCompute
+        {
+            Shader = procCs,
+            Kernel = procCs.FindKernel("EvaluateMaterial"),
             MaterialIndex = ProceduralTargetMaterial,
             Bind = cb =>
             {
-                cb.SetComputeVectorParam(cs, "_ColorA", ProcColorA);
-                cb.SetComputeVectorParam(cs, "_ColorB", ProcColorB);
-                cb.SetComputeFloatParam(cs, "_CheckerScale", ProcCheckerScale);
+                cb.SetComputeVectorParam(procCs, "_ColorA", ProcColorA);
+                cb.SetComputeVectorParam(procCs, "_ColorB", ProcColorB);
+                cb.SetComputeFloatParam(procCs, "_CheckerScale",
+                                        ProcCheckerScale);
             }
         };
-        _materialComputes.Add(_procedural);
+        Tracer.MaterialComputes.Add(_procedural);
         Log("Procedural material compute registered " +
             $"(material {ProceduralTargetMaterial}, Unity-compiled kernel)");
 
-        // The Shader Graph generated compute drives the floor material.
         var sgCompute = Resources.Load<ComputeShader>("TestGraphGen");
         if (sgCompute == null)
         {
             Log("FAIL: TestGraphGen.compute not found " +
                 "(run MetalRT/Generate Compute From Test Graph)");
-            return;
+            return false;
         }
-        _materialComputes.Add
+        Tracer.MaterialComputes.Add
           (MakeShaderGraphCompute(sgCompute, _materials[0], 0));
         Log("Shader Graph material compute registered (material 0, " +
             "generated from TestGraph.shadergraph)");
+        return true;
     }
 
     // Wraps a generated Shader Graph compute shader with a binder that
-    // feeds it the source material's properties (resolved generically from
-    // the shader's property list).
-    MaterialCompute MakeShaderGraphCompute(ComputeShader cs, Material mat,
-                                           int materialIndex)
+    // feeds it the source material's properties.
+    MetalRTPathTracer.MaterialCompute MakeShaderGraphCompute
+      (ComputeShader cs, Material mat, int materialIndex)
     {
         var kernel = cs.FindKernel("EvaluateMaterial");
         var shader = mat.shader;
@@ -612,7 +521,7 @@ public sealed class PathTracerTest : MonoBehaviour
             }
         }
 
-        return new MaterialCompute
+        return new MetalRTPathTracer.MaterialCompute
         {
             Shader = cs,
             Kernel = kernel,
@@ -654,81 +563,16 @@ public sealed class PathTracerTest : MonoBehaviour
         _ => Texture2D.whiteTexture
     };
 
-    TraceParams CameraParams()
-    {
-        var ct = _camera.transform;
-        var tanFov = Mathf.Tan(_camera.fieldOfView * Mathf.Deg2Rad / 2);
-        var (w, h) = (_result.width, _result.height);
-        return new TraceParams
-        {
-            originTan = V4(ct.position, tanFov),
-            rightAspect = V4(ct.right, (float)w / h),
-            up = V4(ct.up, 0),
-            forward = V4(ct.forward, 0),
-            width = (uint)w,
-            height = (uint)h
-        };
-    }
-
-    void TraceFrame()
-    {
-        var p = _cameraOverride ?? CameraParams();
-        var s = _settings;
-        s.reset = _resetQueued;
-        _resetQueued = false;
-
-        _eventSlot = (_eventSlot + 1) % EventRingSize;
-        var blob = _eventData[_eventSlot];
-        WriteEventData(blob, p, _resultPtr, _frameIndex++,
-                       s, MakeInstanceDescs());
-
-        // Phased pipeline: native events with Unity material evaluation
-        // dispatches interleaved between Intersect and Shade of each bounce.
-        var (w, h) = (_result.width, _result.height);
-        var (gx, gy) = ((w + 7) / 8, (h + 7) / 8);
-
-        _traceCommands.Clear();
-        _traceCommands.IssuePluginEventAndData(_eventFunc, PhaseBegin, blob);
-        for (var b = 0; b < s.maxBounces; b++)
-        {
-            _traceCommands.IssuePluginEventAndData
-              (_eventFunc, PhaseIntersect | b << 8, blob);
-            foreach (var mc in _materialComputes)
-            {
-                if (!mc.Enabled) continue;
-                _traceCommands.SetComputeBufferParam
-                  (mc.Shader, mc.Kernel, "_Attributes", _attrBuffer);
-                _traceCommands.SetComputeBufferParam
-                  (mc.Shader, mc.Kernel, "_Surfaces", _surfBuffer);
-                _traceCommands.SetComputeIntParam(mc.Shader, "_Width", w);
-                _traceCommands.SetComputeIntParam(mc.Shader, "_Height", h);
-                _traceCommands.SetComputeIntParam
-                  (mc.Shader, "_MaterialIndex", mc.MaterialIndex);
-                mc.Bind?.Invoke(_traceCommands);
-                _traceCommands.DispatchCompute(mc.Shader, mc.Kernel, gx, gy, 1);
-            }
-            _traceCommands.IssuePluginEventAndData
-              (_eventFunc, PhaseShade | b << 8, blob);
-        }
-        _traceCommands.IssuePluginEventAndData(_eventFunc, PhaseResolve, blob);
-        Graphics.ExecuteCommandBuffer(_traceCommands);
-        _tracedFrames++;
-    }
-
-    // Analytic radiance tests (T1 direct lighting, T2 furnace), then the
-    // production progressive render.
+    // Analytic radiance tests (T1 direct lighting, T2 furnace, T3/T4
+    // Unity-compiled material evaluation), then the production render.
 
     IEnumerator RunTestSequence()
     {
-        // The floor's material evaluation compute (Shader Graph) is toggled
-        // per test phase; when disabled the native Lit path evaluates the
-        // floor from the material table (same base map and tint).
-        var sgCompute = _materialComputes.Count > 1 ?
-          _materialComputes[^1] : null;
+        var sgCompute = Tracer.MaterialComputes.Count > 1 ?
+          Tracer.MaterialComputes[^1] : null;
 
         // Expected linear floor albedo at a world point: checker base map
-        // sample times the base color tint (cell interiors only, so LOD
-        // differences between the native and graph paths don't matter).
+        // sample times the base color tint (cell interiors only).
         Color FloorAlbedo(Vector3 p)
         {
             var uv = new Vector2((5 - p.x) / 10, (p.z + 5) / 10);
@@ -743,73 +587,70 @@ public sealed class PathTracerTest : MonoBehaviour
         // evaluation. env off, single bounce, diffuse-only BSDF.
         var t1Point = new Vector3(1.5f, 0, -1.8f);
         if (sgCompute != null) sgCompute.Enabled = false;
-        _settings = ProductionSettings();
-        _settings.envColor = Color.black;
-        _settings.maxBounces = 1;
-        _settings.linearOutput = true;
-        _settings.debugFlags = 1; // diffuse only
-        _resetQueued = true;
+        var s = ProductionSettings();
+        s.envColor = Color.black;
+        s.maxBounces = 1;
+        s.linearOutput = true;
+        s.debugFlags = 1; // diffuse only
+        Tracer.Settings = s;
+        Tracer.RequestReset();
 
         for (var i = 0; i < TestFrames; i++) yield return null;
 
         {
             var albedo = FloorAlbedo(t1Point);
-            var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
-            var expected = (Color)(albedo * _settings.lightColor) *
-                           (cos / Mathf.PI);
+            var cos = Vector3.Dot(Vector3.up, -s.lightDir);
+            var expected = (Color)(albedo * s.lightColor) * (cos / Mathf.PI);
             var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
             CheckClose("T1 direct lighting (floor)", measured, expected, 0.03f);
         }
 
         // T2: furnace test on a convex Lambertian sphere in a uniform
-        // environment. Every path returns exactly rho * env.
+        // environment, viewed through a virtual camera.
         var env = new Color(0.5f, 0.5f, 0.5f);
-        _settings = ProductionSettings();
-        _settings.envColor = env;
-        _settings.lightColor = Color.black;
-        _settings.maxBounces = 2;
-        _settings.linearOutput = true;
-        _settings.debugFlags = 1; // diffuse only
-        _cameraOverride = LookAtParams(FurnaceCenter + new Vector3(0, 0, -4),
-                                       FurnaceCenter);
-        _resetQueued = true;
+        s = ProductionSettings();
+        s.envColor = env;
+        s.lightColor = Color.black;
+        s.maxBounces = 2;
+        s.linearOutput = true;
+        s.debugFlags = 1; // diffuse only
+        Tracer.Settings = s;
+        Tracer.CameraOverride =
+          LookAtParams(FurnaceCenter + new Vector3(0, 0, -4), FurnaceCenter);
+        Tracer.RequestReset();
 
         for (var i = 0; i < TestFrames; i++) yield return null;
 
         {
             var rho = _materials[5].GetColor("_BaseColor").linear;
             var expected = (Color)(rho * env);
-            var center = new Vector2Int(_result.width / 2, _result.height / 2);
+            var result = Tracer.Result;
+            var center = new Vector2Int(result.width / 2, result.height / 2);
             var measured = ReadResultAverage(center, 2);
             CheckClose("T2 furnace (rho=0.5 sphere)", measured, expected, 0.02f);
         }
 
-        // T3: Unity-compiled material evaluation in the loop. Same setup as
-        // T1, but the procedural compute shader overrides the floor
-        // material, so the measured pixel must match the C#-replicated
-        // procedural pattern (validates the wavefront interop end to end).
+        // T3: hand-written Unity-compiled material evaluation on the floor.
         _procedural.MaterialIndex = 0; // floor (sg compute stays disabled)
-        _settings = ProductionSettings();
-        _settings.envColor = Color.black;
-        _settings.maxBounces = 1;
-        _settings.linearOutput = true;
-        _settings.debugFlags = 1; // diffuse only
-        _cameraOverride = null;
-        _resetQueued = true;
+        s = ProductionSettings();
+        s.envColor = Color.black;
+        s.maxBounces = 1;
+        s.linearOutput = true;
+        s.debugFlags = 1; // diffuse only
+        Tracer.Settings = s;
+        Tracer.CameraOverride = null;
+        Tracer.RequestReset();
 
         for (var i = 0; i < TestFrames; i++) yield return null;
 
         {
-            // Replicate the procedural pattern (Plane.obj UV mapping with
-            // the importer's x flip).
             var uv = new Vector2((5 - t1Point.x) / 10, (t1Point.z + 5) / 10);
             var cell = uv * ProcCheckerScale;
             var checker = Mathf.Abs(Mathf.Floor(cell.x) + Mathf.Floor(cell.y))
                           % 2;
             var albedo = Color.Lerp(ProcColorA, ProcColorB, checker);
-            var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
-            var expected = (Color)(albedo * _settings.lightColor) *
-                           (cos / Mathf.PI);
+            var cos = Vector3.Dot(Vector3.up, -s.lightDir);
+            var expected = (Color)(albedo * s.lightColor) * (cos / Mathf.PI);
             var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
             CheckClose("T3 Unity-compiled material (floor)", measured,
                        expected, 0.03f);
@@ -818,51 +659,60 @@ public sealed class PathTracerTest : MonoBehaviour
         _procedural.MaterialIndex = ProceduralTargetMaterial;
         if (sgCompute != null) sgCompute.Enabled = true;
 
-        // T4: Shader Graph generated compute on the floor. The graph
-        // multiplies the checker base map by _BaseColor, so the measured
-        // pixel must match the C#-replicated texture sample. This validates
-        // the automated graph extraction end to end.
+        // T4: Shader Graph generated compute on the floor. The base color
+        // is tinted during the test: the generated compute reads material
+        // properties live, while the native Lit fallback keeps its setup
+        // snapshot (white) — so the test only passes when the generated
+        // kernel really runs.
         if (sgCompute != null)
         {
-            _settings = ProductionSettings();
-            _settings.envColor = Color.black;
-            _settings.maxBounces = 1;
-            _settings.linearOutput = true;
-            _settings.debugFlags = 1; // diffuse only
-            _resetQueued = true;
+            _materials[0].SetColor("_BaseColor",
+                                   new Color(0.55f, 0.75f, 1.0f));
+            s = ProductionSettings();
+            s.envColor = Color.black;
+            s.maxBounces = 1;
+            s.linearOutput = true;
+            s.debugFlags = 1; // diffuse only
+            Tracer.Settings = s;
+            Tracer.RequestReset();
 
             for (var i = 0; i < TestFrames; i++) yield return null;
 
             {
                 var albedo = FloorAlbedo(t1Point);
-                var cos = Vector3.Dot(Vector3.up, -_settings.lightDir);
-                var expected = (Color)(albedo * _settings.lightColor) *
+                var cos = Vector3.Dot(Vector3.up, -s.lightDir);
+                var expected = (Color)(albedo * s.lightColor) *
                                (cos / Mathf.PI);
                 var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
                 CheckClose("T4 Shader Graph generated material (floor)",
                            measured, expected, 0.03f);
             }
+
+            _materials[0].SetColor("_BaseColor", Color.white);
         }
 
         // Production: progressive path tracing of the visible scene.
-        _settings = ProductionSettings();
-        _cameraOverride = null;
-        _resetQueued = true;
+        Tracer.Settings = ProductionSettings();
+        Tracer.CameraOverride = null;
+        Tracer.RequestReset();
         _tracedFrames = 0;
 
         while (_tracedFrames < SaveFrame) yield return null;
 
         Log($"Render thread events executed: {MetalRT_GetEventFrameCount()} " +
-            $"(total issued: {_frameIndex})");
+            $"(tracer frames issued: {Tracer.FrameIndex})");
         SaveResultImage();
     }
 
     Vector2Int WorldToResultPixel(Vector3 worldPos)
     {
+        // The left (reference) camera shares pose/fov/aspect with the path
+        // traced camera, so its projection maps 1:1 onto the result texture.
         var sp = _camera.WorldToScreenPoint(worldPos);
         var p = new Vector2Int(Mathf.RoundToInt(sp.x), Mathf.RoundToInt(sp.y));
+        var result = Tracer.Result;
         if (sp.z <= 0 || p.x < 2 || p.y < 2 ||
-            p.x >= _result.width - 2 || p.y >= _result.height - 2)
+            p.x >= result.width - 2 || p.y >= result.height - 2)
             Log($"WARNING: test point {worldPos} projects off screen ({p})");
         return p;
     }
@@ -872,7 +722,8 @@ public sealed class PathTracerTest : MonoBehaviour
         var fwd = (target - position).normalized;
         var right = Vector3.Cross(Vector3.up, fwd).normalized;
         var up = Vector3.Cross(fwd, right);
-        var (w, h) = (_result.width, _result.height);
+        var result = Tracer.Result;
+        var (w, h) = (result.width, result.height);
         return new TraceParams
         {
             originTan = V4(position, Mathf.Tan(45 * Mathf.Deg2Rad / 2)),
@@ -885,13 +736,12 @@ public sealed class PathTracerTest : MonoBehaviour
     }
 
     // Reads back a small region of the (linear output mode) result texture
-    // and returns the average color. ReadPixels flushes the render thread,
-    // so the last issued frame is included.
+    // and returns the average color.
     Color ReadResultAverage(Vector2Int center, int radius)
     {
         var n = radius * 2 + 1;
         var prev = RenderTexture.active;
-        RenderTexture.active = _result;
+        RenderTexture.active = Tracer.Result;
         var tex = new Texture2D(n, n, TextureFormat.RGBAFloat, false);
         tex.ReadPixels(new Rect(center.x - radius, center.y - radius, n, n),
                        0, 0);
@@ -919,9 +769,10 @@ public sealed class PathTracerTest : MonoBehaviour
 
     void SaveResultImage()
     {
-        var (w, h) = (_result.width, _result.height);
+        var result = Tracer.Result;
+        var (w, h) = (result.width, result.height);
         var prev = RenderTexture.active;
-        RenderTexture.active = _result;
+        RenderTexture.active = result;
         var tex = new Texture2D(w, h, TextureFormat.RGBAFloat, false);
         tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
         RenderTexture.active = prev;

@@ -49,17 +49,58 @@ public static class MetalRTPlugin
         public long pad2;
     }
 
+    // Punctual light description; must match LightDesc in MetalRTPlugin.mm.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LightDesc
+    {
+        public Vector4 position;  // xyz; w: type (0: dir, 1: point, 2: spot)
+        public Vector4 direction; // xyz: direction the light travels; w: range
+        public Vector4 color;     // linear color * intensity * pi
+        public Vector4 spot;      // x: angle scale, y: angle offset
+    }
+
+    public const int MaxLights = 4;
+
     // Per-frame settings carried in the event data blob.
     public struct FrameSettings
     {
-        public Color envColor;    // linear radiance
-        public Vector3 lightDir;  // direction the light travels
-        public Color lightColor;  // linear color * intensity
+        public Color envColor;     // linear radiance
+        public LightDesc[] lights; // up to MaxLights (null = none)
         public bool reset;
         public uint maxBounces;
-        public bool linearOutput; // skip tonemap/sRGB (analytic tests)
-        public uint debugFlags;   // 1 = diffuse only
+        public bool linearOutput;  // skip tonemap/sRGB (analytic tests)
+        public uint debugFlags;    // 1 = diffuse only
         public float exposure;
+    }
+
+    // Builds a LightDesc from a Unity Light (URP punctual conventions;
+    // color premultiplied by pi for the normalized BRDF).
+    public static LightDesc MakeLightDesc(Light light)
+    {
+        var type = light.type switch
+        {
+            LightType.Directional => 0f,
+            LightType.Point => 1f,
+            LightType.Spot => 2f,
+            _ => -1f
+        };
+        var color = light.color.linear * (light.intensity * Mathf.PI);
+        var desc = new LightDesc
+        {
+            position = light.transform.position,
+            direction = light.transform.forward,
+            color = new Vector4(color.r, color.g, color.b, 0)
+        };
+        desc.position.w = type;
+        desc.direction.w = light.range;
+        if (light.type == LightType.Spot)
+        {
+            var cosOuter = Mathf.Cos(light.spotAngle * Mathf.Deg2Rad / 2);
+            var cosInner = Mathf.Cos(light.innerSpotAngle * Mathf.Deg2Rad / 2);
+            var scale = 1 / Mathf.Max(cosInner - cosOuter, 1e-4f);
+            desc.spot = new Vector4(scale, -cosOuter * scale, 0, 0);
+        }
+        return desc;
     }
 
     public const uint NoAttribute = 0xffffffffu;
@@ -113,7 +154,9 @@ public static class MetalRTPlugin
 
     static readonly int ParamsSize = Marshal.SizeOf<TraceParams>(); // 80
     static readonly int DescSize = Marshal.SizeOf<InstanceDesc>();  // 112
-    const int HeaderSize = 176;
+    static readonly int LightSize = Marshal.SizeOf<LightDesc>();    // 64
+    const int LightsOffset = 144;
+    static readonly int HeaderSize = LightsOffset + LightSize * MaxLights;
 
     public static int EventDataSize
       => HeaderSize + DescSize * MaxInstances;
@@ -123,18 +166,24 @@ public static class MetalRTPlugin
       (IntPtr blob, in TraceParams p, IntPtr texture, uint frameIndex,
        in FrameSettings s, InstanceDesc[] instances)
     {
+        var lightCount = Mathf.Min(s.lights?.Length ?? 0, MaxLights);
+
         Marshal.StructureToPtr(p, blob, false);
         Marshal.WriteInt64(blob, 80, texture.ToInt64());
         Marshal.WriteInt32(blob, 88, instances.Length);
         Marshal.WriteInt32(blob, 92, (int)frameIndex);
         WriteVec(blob, 96, s.envColor.r, s.envColor.g, s.envColor.b, 0);
-        WriteVec(blob, 112, s.lightDir.x, s.lightDir.y, s.lightDir.z, 0);
-        WriteVec(blob, 128, s.lightColor.r, s.lightColor.g, s.lightColor.b, 0);
-        Marshal.WriteInt32(blob, 144, s.reset ? 1 : 0);
-        Marshal.WriteInt32(blob, 148, (int)s.maxBounces);
-        Marshal.WriteInt32(blob, 152, s.linearOutput ? 1 : 0);
-        Marshal.WriteInt32(blob, 156, (int)s.debugFlags);
-        WriteVec(blob, 160, s.exposure, 0, 0, 0);
+        Marshal.WriteInt32(blob, 112, s.reset ? 1 : 0);
+        Marshal.WriteInt32(blob, 116, (int)s.maxBounces);
+        Marshal.WriteInt32(blob, 120, s.linearOutput ? 1 : 0);
+        Marshal.WriteInt32(blob, 124, (int)s.debugFlags);
+        Marshal.WriteInt32(blob, 128,
+                           BitConverter.SingleToInt32Bits(s.exposure));
+        Marshal.WriteInt32(blob, 132, lightCount);
+        for (var i = 0; i < lightCount; i++)
+            Marshal.StructureToPtr
+              (s.lights[i], IntPtr.Add(blob, LightsOffset + LightSize * i),
+               false);
         for (var i = 0; i < instances.Length; i++)
             Marshal.StructureToPtr
               (instances[i], IntPtr.Add(blob, HeaderSize + DescSize * i), false);

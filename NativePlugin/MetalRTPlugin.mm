@@ -149,22 +149,33 @@ enum DebugFlags
     kDebugDiffuseOnly = 1, // disable the specular lobe (analytic tests)
 };
 
+constexpr int kMaxLights = 4;
+
+// Must match LightDesc in MetalRTPlugin.cs and in the shader source.
+struct LightDesc
+{
+    float position[4];  // xyz; w: type (0: directional, 1: point, 2: spot)
+    float direction[4]; // xyz: direction the light travels; w: range
+    float color[4];     // linear color * intensity * pi
+    float spot[4];      // x: angle scale, y: angle offset (URP convention)
+};
+
 // Must match the event data blob layout in MetalRTPlugin.cs.
 struct EventData
 {
-    TraceParams params;    // 80
+    TraceParams params;    // 0
     uint64_t texture;      // 80: RenderTexture native pointer
     int32_t instanceCount; // 88
     uint32_t frameIndex;   // 92
     float envColor[4];     // 96: linear radiance of the uniform environment
-    float lightDir[4];     // 112: xyz: direction the light travels (normalized)
-    float lightColor[4];   // 128: linear color * intensity
-    uint32_t reset;        // 144
-    uint32_t maxBounces;   // 148
-    uint32_t linearOutput; // 152: 1 = skip tonemap (analytic tests)
-    uint32_t debugFlags;   // 156
-    float exposure;        // 160
-    float pad[3];          // 164..176
+    uint32_t reset;        // 112
+    uint32_t maxBounces;   // 116
+    uint32_t linearOutput; // 120: 1 = skip tonemap (analytic tests)
+    uint32_t debugFlags;   // 124
+    float exposure;        // 128
+    uint32_t lightCount;   // 132
+    float pad[2];          // 136..144
+    LightDesc lights[kMaxLights];            // 144..400
     InstanceDesc instances[kMaxEventInstances];
 };
 
@@ -197,11 +208,11 @@ struct FrameConstants
 {
     TraceParams cam;
     float envColor[4];
-    float lightDir[4];
-    float lightColor[4];
     uint32_t frameIndex, maxBounces, linearOutput, debugFlags;
     float exposure;
-    uint32_t pad[3];
+    uint32_t lightCount;
+    uint32_t pad[2];
+    LightDesc lights[kMaxLights];
 };
 
 FrameConstants s_Frame; // set at kPhaseBegin, reused by later phases
@@ -225,15 +236,23 @@ struct TraceParams
     uint width, height, pad0, pad1;
 };
 
+struct LightDesc
+{
+    float4 position;  // xyz; w: type (0: directional, 1: point, 2: spot)
+    float4 direction; // xyz: direction the light travels; w: range
+    float4 color;     // linear color * intensity * pi
+    float4 spot;      // x: angle scale, y: angle offset
+};
+
 struct FrameConstants
 {
     TraceParams cam;
     float4 envColor;
-    float4 lightDir;
-    float4 lightColor;
     uint frameIndex, maxBounces, linearOutput, debugFlags;
     float exposure;
-    uint pad0, pad1, pad2;
+    uint lightCount;
+    uint pad0, pad1;
+    LightDesc lights[4];
 };
 
 struct ProbeResult
@@ -724,16 +743,50 @@ kernel void Shade
 
     path.radiance.xyz += path.throughput.xyz * surf.emission.xyz;
 
-    // Next event estimation for the directional light
-    float3 wl = -frame.lightDir.xyz;
-    float nol = dot(normal, wl);
-    if (nol > 0 && Luminance(frame.lightColor.xyz) > 0)
+    // Next event estimation for punctual lights (directional/point/spot,
+    // URP attenuation conventions)
+    for (uint li = 0; li < frame.lightCount; li++)
     {
+        LightDesc light = frame.lights[li];
+        int type = (int)light.position.w;
+
+        float3 wl;
+        float shadowMax = INFINITY;
+        float atten = 1;
+        if (type == 0)
+        {
+            wl = -light.direction.xyz;
+        }
+        else
+        {
+            float3 dv = light.position.xyz - position;
+            float d2 = max(dot(dv, dv), 1e-6);
+            float dist = sqrt(d2);
+            wl = dv / dist;
+            shadowMax = dist - kRayEpsilon;
+
+            // URP distance attenuation: 1/d^2 with smooth range window
+            float r2 = light.direction.w * light.direction.w;
+            float window = saturate(1 - (d2 / r2) * (d2 / r2));
+            atten = window * window / d2;
+
+            if (type == 2) // spot angle attenuation
+            {
+                float cd = dot(-wl, normalize(light.direction.xyz));
+                float a = saturate(cd * light.spot.x + light.spot.y);
+                atten *= a * a;
+            }
+        }
+
+        float nol = dot(normal, wl);
+        if (nol <= 0 || atten <= 0 ||
+            Luminance(light.color.xyz) <= 0) continue;
+
         ray shadow;
         shadow.origin = position + normal * kRayEpsilon;
         shadow.direction = wl;
         shadow.min_distance = 0;
-        shadow.max_distance = INFINITY;
+        shadow.max_distance = shadowMax;
 
         intersector<triangle_data, instancing> occ;
         occ.accept_any_intersection(true);
@@ -742,7 +795,8 @@ kernel void Shade
 
         if (sh.type == intersection_type::none)
             path.radiance.xyz += path.throughput.xyz *
-              EvalBsdf(bsdf, normal, wo, wl) * nol * frame.lightColor.xyz;
+              EvalBsdf(bsdf, normal, wo, wl) * nol *
+              light.color.xyz * atten;
     }
 
     // Sample the next bounce
@@ -1099,13 +1153,17 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
 
         s_Frame = {};
         s_Frame.cam = ev->params;
-        std::memcpy(s_Frame.envColor, ev->envColor, sizeof(float) * 12);
+        std::memcpy(s_Frame.envColor, ev->envColor, sizeof(float) * 4);
         s_Frame.frameIndex = ev->frameIndex;
         s_Frame.maxBounces =
           std::min(std::max(ev->maxBounces, 1u), kMaxBounceLimit);
         s_Frame.linearOutput = ev->linearOutput;
         s_Frame.debugFlags = ev->debugFlags;
         s_Frame.exposure = ev->exposure;
+        s_Frame.lightCount =
+          std::min(ev->lightCount, (uint32_t)kMaxLights);
+        std::memcpy(s_Frame.lights, ev->lights,
+                    sizeof(LightDesc) * kMaxLights);
 
         id<MTLBuffer> info = nil;
         MTLInstanceAccelerationStructureDescriptor* descriptor =

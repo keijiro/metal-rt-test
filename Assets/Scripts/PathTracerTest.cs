@@ -30,6 +30,7 @@ public sealed class PathTracerTest : MonoBehaviour
     const float FurnaceScale = 2; // base radius 0.5 -> radius 1
     static readonly Vector3 VertexColorCenter = new Vector3(30, 50, 0);
     static readonly Vector3 CutoutCenter = new Vector3(60, 50, 0);
+    static readonly Vector3 PunctualCenter = new Vector3(90, 50, 0);
     const float TestQuadScale = 2; // quad extent +-1 -> +-2
 
     static readonly Color32[] QuadCorners =
@@ -52,12 +53,13 @@ public sealed class PathTracerTest : MonoBehaviour
     Camera _camera;   // left half: URP raster reference
     Camera _ptCamera; // right half: URP camera with the path tracer feature
     Light _light;
+    Light _pointLight, _spotLight; // T8 test lights (disabled by default)
     MetalRTSceneRegistry _registry;
 
     Material _floorMat, _torusMat, _metalMat, _whiteMat, _glowMat,
-             _furnaceMat, _vcMat, _cutoutMat;
+             _furnaceMat, _vcMat, _cutoutMat, _punctualMat;
     Transform _floorT, _torusT, _metalT, _whiteT, _glowT, _furnaceT,
-              _vcT, _cutoutT;
+              _vcT, _cutoutT, _punctualT;
 
     MetalRTPathTracer.MaterialCompute _procedural;
     MetalRTPathTracer.MaterialCompute _sgCompute;
@@ -113,6 +115,12 @@ public sealed class PathTracerTest : MonoBehaviour
 
     void SetUpScene()
     {
+        // Remove any pre-existing lights (e.g., the default scene light) so
+        // the light set is fully under the harness's control — the path
+        // tracer now consumes every enabled punctual light in the scene.
+        foreach (var l in FindObjectsByType<Light>(FindObjectsSortMode.None))
+            DestroyImmediate(l.gameObject);
+
         var plane = Resources.Load<Mesh>("Plane");
         var torus = Resources.Load<Mesh>("Torus");
         var sphere = Resources.Load<Mesh>("Sphere");
@@ -150,12 +158,37 @@ public sealed class PathTracerTest : MonoBehaviour
         _cutoutT = Spawn("Cutout Quad", quad, _cutoutMat,
                          CutoutCenter, TestQuadScale);
 
+        // Punctual light receiver (T8): solid gray quad facing -Z with a
+        // point and a spot light in front (disabled until the test).
+        _punctualMat = MakeLitMaterial(new Color(0.5f, 0.5f, 0.5f), 0, 0.2f);
+        _punctualT = Spawn("Punctual Quad", quad, _punctualMat,
+                           PunctualCenter, TestQuadScale);
+
         _light = new GameObject("Directional Light", typeof(Light))
                    .GetComponent<Light>();
         _light.type = LightType.Directional;
         _light.transform.rotation = Quaternion.Euler(50, -30, 0);
         _light.color = Color.white;
         _light.intensity = 1.5f;
+
+        _pointLight = new GameObject("Test Point Light", typeof(Light))
+                        .GetComponent<Light>();
+        _pointLight.type = LightType.Point;
+        _pointLight.transform.position = PunctualCenter + new Vector3(0, 0, -3);
+        _pointLight.range = 10;
+        _pointLight.intensity = 2;
+        _pointLight.enabled = false;
+
+        _spotLight = new GameObject("Test Spot Light", typeof(Light))
+                       .GetComponent<Light>();
+        _spotLight.type = LightType.Spot;
+        _spotLight.transform.position = PunctualCenter + new Vector3(0, 0, -3);
+        _spotLight.transform.rotation = Quaternion.identity; // aims +Z
+        _spotLight.range = 10;
+        _spotLight.intensity = 2;
+        _spotLight.spotAngle = 60;
+        _spotLight.innerSpotAngle = 40;
+        _spotLight.enabled = false;
 
         RenderSettings.ambientMode = AmbientMode.Flat;
         RenderSettings.ambientLight = new Color(0.15f, 0.17f, 0.22f);
@@ -188,13 +221,30 @@ public sealed class PathTracerTest : MonoBehaviour
     FrameSettings ProductionSettings() => new FrameSettings
     {
         envColor = RenderSettings.ambientLight.linear,
-        lightDir = _light.transform.forward,
-        // Unity's punctual light convention folds 1/pi into the Lambert
-        // term, so premultiply by pi for the physically normalized BRDF.
-        lightColor = _light.color.linear * (_light.intensity * Mathf.PI),
+        lights = CollectLights(),
         maxBounces = ProductionBounces,
         exposure = 1
     };
+
+    // Gathers the scene's enabled punctual lights (up to MaxLights).
+    static LightDesc[] CollectLights()
+    {
+        var lights = FindObjectsByType<Light>(FindObjectsSortMode.InstanceID);
+        var list = new System.Collections.Generic.List<LightDesc>();
+        foreach (var l in lights)
+        {
+            if (!l.isActiveAndEnabled || list.Count >= MaxLights) continue;
+            if (l.type != LightType.Directional && l.type != LightType.Point &&
+                l.type != LightType.Spot) continue;
+            list.Add(MakeLightDesc(l));
+        }
+        return list.ToArray();
+    }
+
+    // Directional light contribution used by floor test expectations.
+    (Vector3 toLight, Color color) DirLight()
+      => (-_light.transform.forward,
+          _light.color.linear * (_light.intensity * Mathf.PI));
 
     Material MakeShaderGraphMaterial()
     {
@@ -436,8 +486,9 @@ public sealed class PathTracerTest : MonoBehaviour
 
         {
             var albedo = FloorAlbedo(t1Point);
-            var cos = Vector3.Dot(Vector3.up, -s.lightDir);
-            var expected = (Color)(albedo * s.lightColor) * (cos / Mathf.PI);
+            var (toLight, lightColor) = DirLight();
+            var cos = Vector3.Dot(Vector3.up, toLight);
+            var expected = (Color)(albedo * lightColor) * (cos / Mathf.PI);
             var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
             CheckClose("T1 direct lighting (floor)", measured, expected, 0.03f);
         }
@@ -447,7 +498,7 @@ public sealed class PathTracerTest : MonoBehaviour
         var env = new Color(0.5f, 0.5f, 0.5f);
         s = ProductionSettings();
         s.envColor = env;
-        s.lightColor = Color.black;
+        s.lights = Array.Empty<LightDesc>();
         s.maxBounces = 2;
         s.linearOutput = true;
         s.debugFlags = 1; // diffuse only
@@ -486,8 +537,9 @@ public sealed class PathTracerTest : MonoBehaviour
             var checker = Mathf.Abs(Mathf.Floor(cell.x) + Mathf.Floor(cell.y))
                           % 2;
             var albedo = Color.Lerp(ProcColorA, ProcColorB, checker);
-            var cos = Vector3.Dot(Vector3.up, -s.lightDir);
-            var expected = (Color)(albedo * s.lightColor) * (cos / Mathf.PI);
+            var (toLight, lightColor) = DirLight();
+            var cos = Vector3.Dot(Vector3.up, toLight);
+            var expected = (Color)(albedo * lightColor) * (cos / Mathf.PI);
             var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
             CheckClose("T3 Unity-compiled material (floor)", measured,
                        expected, 0.03f);
@@ -511,8 +563,9 @@ public sealed class PathTracerTest : MonoBehaviour
 
         {
             var albedo = FloorAlbedo(t1Point);
-            var cos = Vector3.Dot(Vector3.up, -s.lightDir);
-            var expected = (Color)(albedo * s.lightColor) * (cos / Mathf.PI);
+            var (toLight, lightColor) = DirLight();
+            var cos = Vector3.Dot(Vector3.up, toLight);
+            var expected = (Color)(albedo * lightColor) * (cos / Mathf.PI);
             var measured = ReadResultAverage(WorldToResultPixel(t1Point), 2);
             CheckClose("T4 Shader Graph generated material (floor)",
                        measured, expected, 0.03f);
@@ -523,7 +576,7 @@ public sealed class PathTracerTest : MonoBehaviour
         // T5: vertex color input path (furnace setup on the color quad).
         s = ProductionSettings();
         s.envColor = env;
-        s.lightColor = Color.black;
+        s.lights = Array.Empty<LightDesc>();
         s.maxBounces = 2;
         s.linearOutput = true;
         s.debugFlags = 1; // diffuse only
@@ -595,6 +648,66 @@ public sealed class PathTracerTest : MonoBehaviour
             CheckClose("T6b alpha clip (solid cell = albedo*env)", measured,
                        expected, 0.03f);
         }
+
+        // T8: punctual lights (URP attenuation conventions) on a flat gray
+        // receiver quad. The light sits on the quad's normal axis 3 units
+        // away, so at the center: cos = 1, d^2 = 9. Expected radiance =
+        // albedo * color * intensity * window(d,range) / d^2.
+        var t8Camera = LookAtParams(PunctualCenter + new Vector3(0, 0, -5),
+                                    PunctualCenter);
+        Color PunctualExpected(Light light)
+        {
+            var albedo = _punctualMat.GetColor("_BaseColor").linear;
+            const float d2 = 9;
+            var r2 = light.range * light.range;
+            var window = Mathf.Pow
+              (Mathf.Clamp01(1 - (d2 / r2) * (d2 / r2)), 2);
+            var c = light.color.linear * light.intensity * (window / d2);
+            return albedo * c;
+        }
+
+        _light.enabled = false;
+        _pointLight.enabled = true;
+        s = ProductionSettings(); // picks up the point light only
+        s.envColor = Color.black;
+        s.maxBounces = 1;
+        s.linearOutput = true;
+        s.debugFlags = 1; // diffuse only
+        Tracer.Settings = s;
+        Tracer.CameraOverride = t8Camera;
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t8Camera, PunctualCenter), 2);
+            CheckClose("T8a point light (quad center)", measured,
+                       PunctualExpected(_pointLight), 0.03f);
+        }
+
+        _pointLight.enabled = false;
+        _spotLight.enabled = true;
+        s = ProductionSettings(); // picks up the spot light only
+        s.envColor = Color.black;
+        s.maxBounces = 1;
+        s.linearOutput = true;
+        s.debugFlags = 1;
+        Tracer.Settings = s;
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            // On the spot axis the angle attenuation saturates to 1.
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t8Camera, PunctualCenter), 2);
+            CheckClose("T8b spot light (on axis)", measured,
+                       PunctualExpected(_spotLight), 0.03f);
+        }
+
+        _spotLight.enabled = false;
+        _light.enabled = true;
 
         // Production: progressive path tracing of the visible scene.
         Tracer.Settings = ProductionSettings();

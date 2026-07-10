@@ -51,6 +51,8 @@ public sealed class MetalRTPathTracer
     bool _resetQueued = true;
     Matrix4x4 _lastCamera;
     float _lastFov;
+    InstanceDesc[] _lastDescs;
+    FrameSettings _lastSettings;
 
     const int EventRingSize = 4;
 
@@ -152,6 +154,14 @@ public sealed class MetalRTPathTracer
             _lastFov = camera.fieldOfView;
         }
 
+        // Restart accumulation when the scene content changes: instance
+        // transforms/additions/removals or lighting/settings edits.
+        var descs = _instancesProvider();
+        if (!DescsEqual(descs, _lastDescs)) _resetQueued = true;
+        _lastDescs = descs;
+        if (!SettingsEqual(Settings, _lastSettings)) _resetQueued = true;
+        _lastSettings = Settings;
+
         var p = CameraOverride ?? CameraParams(camera);
         var s = Settings;
         s.reset = _resetQueued;
@@ -159,8 +169,7 @@ public sealed class MetalRTPathTracer
 
         _eventSlot = (_eventSlot + 1) % EventRingSize;
         var blob = _eventData[_eventSlot];
-        WriteEventData(blob, p, _resultPtr, _frameIndex++, s,
-                       _instancesProvider());
+        WriteEventData(blob, p, _resultPtr, _frameIndex++, s, descs);
 
         var (w, h) = (_result.width, _result.height);
         var (gx, gy) = ((w + 7) / 8, (h + 7) / 8);
@@ -187,6 +196,39 @@ public sealed class MetalRTPathTracer
             cmd.IssuePluginEventAndData(_eventFunc, PhaseShade | b << 8, blob);
         }
         cmd.IssuePluginEventAndData(_eventFunc, PhaseResolve, blob);
+    }
+
+    static bool DescsEqual(InstanceDesc[] a, InstanceDesc[] b)
+    {
+        if (a == null || b == null || a.Length != b.Length) return false;
+        for (var i = 0; i < a.Length; i++)
+        {
+            if (a[i].meshIndex != b[i].meshIndex ||
+                a[i].materialIndex != b[i].materialIndex ||
+                a[i].objectToWorld0 != b[i].objectToWorld0 ||
+                a[i].objectToWorld1 != b[i].objectToWorld1 ||
+                a[i].objectToWorld2 != b[i].objectToWorld2) return false;
+        }
+        return true;
+    }
+
+    static bool SettingsEqual(in FrameSettings a, in FrameSettings b)
+    {
+        if (a.envColor != b.envColor || a.maxBounces != b.maxBounces ||
+            a.linearOutput != b.linearOutput ||
+            a.debugFlags != b.debugFlags ||
+            !Mathf.Approximately(a.exposure, b.exposure)) return false;
+        var la = a.lights ?? Array.Empty<LightDesc>();
+        var lb = b.lights ?? Array.Empty<LightDesc>();
+        if (la.Length != lb.Length) return false;
+        for (var i = 0; i < la.Length; i++)
+        {
+            if (la[i].position != lb[i].position ||
+                la[i].direction != lb[i].direction ||
+                la[i].color != lb[i].color ||
+                la[i].spot != lb[i].spot) return false;
+        }
+        return true;
     }
 
     TraceParams CameraParams(Camera camera)

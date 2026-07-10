@@ -17,11 +17,45 @@ public sealed class MetalRTSceneRegistry
 
     public bool Build(MetalRTPathTracer tracer)
     {
+        Sync(tracer);
+
+        if (_instances.Count == 0)
+        {
+            Debug.LogError("[MetalRT] No renderers registered");
+            return false;
+        }
+
+        Debug.Log($"[MetalRT] Scene registry: {_instances.Count} instances, " +
+                  $"{_meshes.Count} meshes, {_materials.Count} materials " +
+                  "(auto-registered from MeshRenderers)");
+        return true;
+    }
+
+    // Rescans the scene's MeshRenderers: registers newly appeared meshes
+    // and materials and rebuilds the instance list, so objects can be
+    // added, removed, or re-materialed at runtime. Returns true when
+    // anything changed. (Removed meshes/materials keep their GPU-side
+    // registrations; only the instance list shrinks.)
+    public bool Sync(MetalRTPathTracer tracer)
+    {
         var renderers = UnityEngine.Object.FindObjectsByType<MeshRenderer>
           (FindObjectsSortMode.InstanceID);
 
+        var instances = new List<(int mesh, int material, Transform transform)>();
         foreach (var renderer in renderers)
         {
+            if (instances.Count >= MaxInstances)
+            {
+                if (!_overflowWarned)
+                {
+                    Debug.LogWarning($"[MetalRT] Instance limit reached " +
+                                     $"({MaxInstances}); extra renderers " +
+                                     "are ignored");
+                    _overflowWarned = true;
+                }
+                break;
+            }
+
             var filter = renderer.GetComponent<MeshFilter>();
             var mesh = filter != null ? filter.sharedMesh : null;
             var material = renderer.sharedMaterial;
@@ -31,26 +65,26 @@ public sealed class MetalRTSceneRegistry
             if (meshIndex < 0) continue;
 
             var materialIndex = RegisterMaterial(material, tracer);
-            _instances.Add((meshIndex, materialIndex, renderer.transform));
+            instances.Add((meshIndex, materialIndex, renderer.transform));
         }
 
-        if (_instances.Count == 0)
+        var changed = _materialsDirty || !SameInstances(instances);
+        if (_materialsDirty)
         {
-            Debug.LogError("[MetalRT] No renderers registered");
-            return false;
+            UploadMaterials();
+            _materialsDirty = false;
         }
-        if (_instances.Count > MaxInstances)
-        {
-            Debug.LogError($"[MetalRT] Too many instances " +
-                           $"({_instances.Count} > {MaxInstances})");
-            return false;
-        }
+        _instances.Clear();
+        _instances.AddRange(instances);
+        return changed;
+    }
 
-        if (!UploadMaterials()) return false;
-
-        Debug.Log($"[MetalRT] Scene registry: {_instances.Count} instances, " +
-                  $"{_meshes.Count} meshes, {_materials.Count} materials " +
-                  "(auto-registered from MeshRenderers)");
+    bool SameInstances
+      (List<(int mesh, int material, Transform transform)> instances)
+    {
+        if (instances.Count != _instances.Count) return false;
+        for (var i = 0; i < instances.Count; i++)
+            if (instances[i] != _instances[i]) return false;
         return true;
     }
 
@@ -117,6 +151,8 @@ public sealed class MetalRTSceneRegistry
       _materialComputes = new();
     readonly List<(int mesh, int material, Transform transform)>
       _instances = new();
+    bool _materialsDirty;
+    bool _overflowWarned;
 
     // Mesh registration (BLAS construction from GPU buffers)
 
@@ -214,6 +250,7 @@ public sealed class MetalRTSceneRegistry
         var index = _materials.Count;
         _materials.Add(material);
         _materialIndices.Add(material, index);
+        _materialsDirty = true;
 
         // Non-Lit shaders: attach the compute shader generated from the
         // material's Shader Graph when one exists.

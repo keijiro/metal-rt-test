@@ -183,6 +183,14 @@ editor (the macOS editor never unloads native plugins).
 left half shows URP rasterization, the right half the path traced view of
 the same scene (`MetalRTPathTracerRunner` registers the scene's renderers
 and lights automatically; tweak bounces/exposure on the runner object).
+The scene is fully dynamic: moving, adding, removing, or re-materialing
+objects and editing lights restarts the accumulation automatically.
+
+**Edit mode**: the runner is `[ExecuteAlways]`, so the path traced view
+also works without entering play mode. Since the editor only redraws on
+demand, accumulation normally progresses while you interact with the
+editor; enable **Continuous Edit Refresh** on the runner to keep the
+player loop ticking so the image converges on its own.
 
 **Test suite**: enter play mode in a scene *without* a
 `MetalRTPathTracerRunner` (e.g., an empty scene) — the test harness

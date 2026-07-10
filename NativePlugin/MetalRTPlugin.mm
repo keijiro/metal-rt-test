@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -63,8 +64,9 @@ struct MeshEntry
     uint32_t indexFormat;
 };
 
-// Written on the main thread during setup (before any render event fires),
-// read from the render thread afterwards.
+// Scene state may now grow at runtime (dynamic object registration), so
+// main thread writers and render thread readers share a mutex.
+std::mutex s_SceneMutex;
 std::vector<MeshEntry> s_Meshes;
 id<MTLBuffer> s_MaterialBuffer;
 std::vector<id<MTLTexture>> s_MaterialTextures;
@@ -1112,6 +1114,8 @@ bool RunCommandBuffer(id<MTLCommandBuffer> command)
 MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
   (const InstanceDesc* instances, int32_t count, id<MTLBuffer>* outInfo)
 {
+    std::lock_guard<std::mutex> lock(s_SceneMutex);
+
     id<MTLBuffer> descBuffer = [s_Device
       newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor)
                           * count
@@ -1236,6 +1240,7 @@ void EnsurePathBuffers(uint32_t width, uint32_t height)
 
 void UseSceneResources(id<MTLComputeCommandEncoder> encoder)
 {
+    std::lock_guard<std::mutex> lock(s_SceneMutex);
     for (const auto& mesh : s_Meshes)
     {
         [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
@@ -1531,6 +1536,7 @@ MetalRT_AddMesh
     mesh.blas = BuildAccelerationStructureSync(descriptor);
     if (mesh.blas == nil) return -3;
 
+    std::lock_guard<std::mutex> lock(s_SceneMutex);
     s_Meshes.push_back(mesh);
     return (int)s_Meshes.size() - 1;
 }
@@ -1548,7 +1554,7 @@ MetalRT_SetMaterials(const MaterialDesc* materials, int32_t count)
                   options:MTLResourceStorageModeShared];
     auto* dst = (GpuMaterial*)buffer.contents;
 
-    s_MaterialTextures.clear();
+    std::vector<id<MTLTexture>> textures;
 
     for (int32_t i = 0; i < count; i++)
     {
@@ -1565,10 +1571,12 @@ MetalRT_SetMaterials(const MaterialDesc* materials, int32_t count)
               (__bridge id<MTLTexture>)(void*)src.texture;
             mat.baseMap = texture.gpuResourceID;
             mat.hasBaseMap = 1;
-            s_MaterialTextures.push_back(texture);
+            textures.push_back(texture);
         }
     }
 
+    std::lock_guard<std::mutex> lock(s_SceneMutex);
+    s_MaterialTextures = std::move(textures);
     s_MaterialBuffer = buffer;
     return 0;
 }
@@ -1635,8 +1643,11 @@ MetalRT_TraceProbes(const float* rays, int32_t count, ProbeResult* results)
     [encoder setAccelerationStructure:s_InstanceAS atBufferIndex:0];
     [encoder setBuffer:output offset:0 atIndex:1];
     [encoder setBytes:rays length:sizeof(float) * 8 * count atIndex:2];
-    for (const auto& mesh : s_Meshes)
-        [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
+    {
+        std::lock_guard<std::mutex> lock(s_SceneMutex);
+        for (const auto& mesh : s_Meshes)
+            [encoder useResource:mesh.blas usage:MTLResourceUsageRead];
+    }
     [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [encoder endEncoding];
@@ -1661,6 +1672,7 @@ MetalRT_GetEventFrameCount()
 
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
 {
+    std::lock_guard<std::mutex> lock(s_SceneMutex);
     s_InstanceAS = nil;
     s_InstanceInfo = nil;
     s_MaterialBuffer = nil;

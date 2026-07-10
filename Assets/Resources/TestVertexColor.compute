@@ -3,6 +3,7 @@
 // the VertexColor input path of the wavefront pipeline.
 
 #pragma kernel EvaluateMaterial
+#pragma multi_compile _ _INVERT_ON
 
 struct HitAttributes
 {
@@ -40,7 +41,11 @@ struct SurfaceDescription
 SurfaceDescription SurfaceDescriptionFunction(SurfaceDescriptionInputs IN)
 {
     SurfaceDescription surface;
+#if defined(_INVERT_ON)
+    surface.BaseColor = 1 - IN.VertexColor.rgb;
+#else
     surface.BaseColor = IN.VertexColor.rgb;
+#endif
     return surface;
 }
 

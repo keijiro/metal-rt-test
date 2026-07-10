@@ -557,9 +557,11 @@ public sealed class PathTracerTest : MonoBehaviour
 
         // Off-scene test material evaluators (vertex color, alpha cutout)
         var vcCs = Resources.Load<ComputeShader>("TestVertexColor");
+        var vcMat = _materials[6];
         Tracer.MaterialComputes.Add(new MetalRTPathTracer.MaterialCompute
           { Shader = vcCs, Kernel = vcCs.FindKernel("EvaluateMaterial"),
-            MaterialIndex = 6 });
+            MaterialIndex = 6,
+            Bind = cb => BindMaterialKeywords(cb, vcCs, vcMat) });
         var cutCs = Resources.Load<ComputeShader>("TestCutout");
         Tracer.MaterialComputes.Add(new MetalRTPathTracer.MaterialCompute
           { Shader = cutCs, Kernel = cutCs.FindKernel("EvaluateMaterial"),
@@ -634,8 +636,21 @@ public sealed class PathTracerTest : MonoBehaviour
                   (cs, "_TimeParams",
                    new Vector4(Time.time, Mathf.Sin(Time.time),
                                Mathf.Cos(Time.time), 0));
+                BindMaterialKeywords(cb, cs, mat);
             }
         };
+    }
+
+    // Synchronizes the compute shader's local keywords with the material's
+    // enabled keywords (Shader Graph keyword variants). Uses the raw
+    // keyword string list so keywords not declared by the material's own
+    // shader are honored too.
+    static void BindMaterialKeywords(CommandBuffer cb, ComputeShader cs,
+                                     Material mat)
+    {
+        var enabled = mat.shaderKeywords;
+        foreach (var kw in cs.keywordSpace.keywords)
+            cb.SetKeyword(cs, kw, Array.IndexOf(enabled, kw.name) >= 0);
     }
 
     static Texture DefaultTexture(string name) => name switch
@@ -806,6 +821,29 @@ public sealed class PathTracerTest : MonoBehaviour
             CheckClose("T5 vertex color input (runtime quad)", measured,
                        expected, 0.03f);
         }
+
+        // T7: keyword variants. Enabling _INVERT_ON on the vertex color
+        // quad's material must switch the compute shader to its inverted
+        // variant on the next frame (per-material keyword binding).
+        _materials[6].EnableKeyword("_INVERT_ON");
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            var world = VertexColorCenter +
+              new Vector3(1f / 3, -1f / 3, 0) * TestQuadScale;
+            var albedo = ((Color)QuadCorners[0] + QuadCorners[1] +
+                          QuadCorners[2]) / 3;
+            var inverted = new Color(1 - albedo.r, 1 - albedo.g, 1 - albedo.b);
+            var expected = (Color)(inverted * env);
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t5Camera, world), 2);
+            CheckClose("T7 keyword variant (_INVERT_ON)", measured,
+                       expected, 0.03f);
+        }
+
+        _materials[6].DisableKeyword("_INVERT_ON");
 
         // T6: alpha clip pass-through. The cutout quad clips half its
         // checker cells: clipped cells show the environment behind, solid

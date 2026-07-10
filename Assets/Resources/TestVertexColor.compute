@@ -1,0 +1,67 @@
+// Hand-written material evaluation compute shader (SurfaceDescription
+// style) that outputs the interpolated vertex color as albedo. Validates
+// the VertexColor input path of the wavefront pipeline.
+
+#pragma kernel EvaluateMaterial
+
+struct HitAttributes
+{
+    float4 position;
+    float4 normal;
+    float4 tangent;
+    float4 uvView;
+    float4 viewDir;
+    float4 color;
+    uint4 meta;
+};
+
+struct SurfaceRecord
+{
+    float4 baseColor;
+    float4 normal;
+    float4 emission;
+    float4 params;
+};
+
+StructuredBuffer<HitAttributes> _Attributes;
+RWStructuredBuffer<SurfaceRecord> _Surfaces;
+uint _Width, _Height, _MaterialIndex;
+
+struct SurfaceDescriptionInputs
+{
+    float4 VertexColor;
+};
+
+struct SurfaceDescription
+{
+    float3 BaseColor;
+};
+
+SurfaceDescription SurfaceDescriptionFunction(SurfaceDescriptionInputs IN)
+{
+    SurfaceDescription surface;
+    surface.BaseColor = IN.VertexColor.rgb;
+    return surface;
+}
+
+[numthreads(8, 8, 1)]
+void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height) return;
+    uint idx = id.y * _Width + id.x;
+
+    HitAttributes attr = _Attributes[idx];
+    if (attr.meta.y == 0 || attr.meta.x != _MaterialIndex) return;
+
+    SurfaceDescriptionInputs IN;
+    IN.VertexColor = attr.color;
+
+    SurfaceDescription d = SurfaceDescriptionFunction(IN);
+
+    SurfaceRecord surf;
+    surf.baseColor = float4(d.BaseColor, 1);
+    surf.normal = attr.normal;
+    surf.emission = float4(0, 0, 0, 0);
+    surf.params = float4(0, 0.2, 1, -1);
+    _Surfaces[idx] = surf;
+}

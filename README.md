@@ -77,11 +77,14 @@ project.
   `ShaderGraphImporter.GetShaderText` (internal API via reflection), slices
   out the `SurfaceDescriptionFunction`, its graph functions, the
   `UnityPerMaterial` cbuffer, and texture declarations, then wraps them in a
-  compute kernel that maps path tracer hit attributes (UVs, world-space
-  geometry, view direction, time) to `SurfaceDescriptionInputs`. Texture
-  sampling macros are redefined to their LOD variants for compute. Graphs
-  requiring unsupported inputs (screen position, scene color/depth, etc.)
-  are rejected — this is the "conditional" support boundary.
+  compute kernel that maps path tracer hit attributes (uv0/uv1, vertex
+  color, world-space geometry, view direction, time) to
+  `SurfaceDescriptionInputs`. `Alpha` / `AlphaClipThreshold` outputs map to
+  the surface record for alpha clipping. Texture sampling macros are
+  redefined to their LOD variants for compute. Graphs requiring unsupported
+  inputs (screen position, scene color/depth, etc.) are rejected — this is
+  the "conditional" support boundary. An `AssetPostprocessor` regenerates
+  the compute shader whenever a graph under `Assets/Shaders` is reimported.
 - `Assets/Scripts/MetalRTPathTracer.cs` +
   `Assets/Scripts/MetalRTPathTracerFeature.cs` — The URP integration. The
   runtime core owns the progressive result texture, the shared wavefront
@@ -130,6 +133,17 @@ Analytic tests (logged as PASS/FAIL to the console on play):
   when the generated kernel really runs. Measured relative error:
   **0.48 %**.
 
+- **T5 vertex color input**: a runtime-built quad (made non-readable on
+  upload) with UNorm8 vertex colors, evaluated by a compute shader reading
+  `VertexColor`; the pixel at a triangle centroid must equal the
+  barycentric average of its corner colors. Measured relative error:
+  **0.72 %**.
+- **T6 alpha clipping**: a cutout quad clips half its checker cells via
+  `Alpha` / `AlphaClipThreshold`; clipped cells must show the environment
+  behind (**0.00 %**) and solid cells behave like a flat furnace surface
+  (**0.00 %**). Shadow rays treat clipped geometry as opaque (known
+  limitation).
+
 All of the above run through the URP renderer feature (RenderGraph unsafe
 pass), not a standalone dispatch path.
 
@@ -152,9 +166,11 @@ after rebuilding the plugin.
 
 ## Roadmap
 
-- **Robustness**: broaden the supported Shader Graph input set (multiple
-  UV channels, vertex color), automate generation on graph import, handle
-  alpha clipping (non-opaque intersection), and support keyword variants.
+- **Keyword variants**: support Shader Graph keyword variants in the
+  generated compute shaders (multi_compile + per-material keyword binding).
 - **Scene integration**: register scene meshes/materials automatically
   (renderer component scan) instead of the hand-built test scene, support
   more lights (point/spot/area), and denoise the progressive output.
+- **Alpha-tested shadows**: shadow rays currently treat alpha-clipped
+  geometry as opaque; proper support needs material evaluation on the
+  occlusion path (e.g., Metal intersection function tables).

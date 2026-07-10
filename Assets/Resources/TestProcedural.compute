@@ -13,8 +13,9 @@ struct HitAttributes
     float4 position; // xyz: world position
     float4 normal;   // xyz: world shading normal
     float4 tangent;  // xyz: world tangent, w: bitangent sign
-    float4 uvView;   // xy: uv0
+    float4 uvView;   // xy: uv0, zw: uv1
     float4 viewDir;  // xyz: direction toward the ray origin
+    float4 color;    // vertex color
     uint4 meta;      // x: material index, y: hit flag
 };
 
@@ -23,7 +24,8 @@ struct SurfaceRecord
     float4 baseColor; // rgb: linear albedo
     float4 normal;    // xyz: world shading normal
     float4 emission;  // rgb: linear radiance
-    float4 params;    // x: metallic, y: smoothness
+    float4 params;    // x: metallic, y: smoothness,
+                      // z: alpha, w: clip threshold (< 0: no clipping)
 };
 
 StructuredBuffer<HitAttributes> _Attributes;
@@ -84,6 +86,6 @@ void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
     surf.baseColor = float4(d.BaseColor, 1);
     surf.normal = attr.normal;
     surf.emission = float4(d.Emission, 0);
-    surf.params = float4(d.Metallic, d.Smoothness, 0, 0);
+    surf.params = float4(d.Metallic, d.Smoothness, 1, -1);
     _Surfaces[idx] = surf;
 }

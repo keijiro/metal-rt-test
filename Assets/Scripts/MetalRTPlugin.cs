@@ -43,7 +43,8 @@ public static class MetalRTPlugin
         public Vector4 emission;  // linear
         public Vector4 baseMapST; // xy: scale, zw: offset
         public float metallic, smoothness;
-        public uint hasBaseMap, pad;
+        public float cutoff;      // alpha clip threshold; < 0 disables
+        public uint hasBaseMap;
         public long texture;      // MTLTexture pointer or 0
         public long pad2;
     }
@@ -73,7 +74,7 @@ public static class MetalRTPlugin
     // Shared buffer strides; must match the structs in MetalRTPlugin.mm and
     // TestProcedural.compute.
     public const int HitRecordStride = 32;
-    public const int HitAttributesStride = 96;
+    public const int HitAttributesStride = 112;
     public const int SurfaceRecordStride = 64;
 
     // Native entry points
@@ -86,6 +87,7 @@ public static class MetalRTPlugin
     [DllImport(PluginName)] public static extern int MetalRT_AddMesh
       (IntPtr vertexBuffer, uint vertexStride, uint positionOffset,
        uint normalOffset, uint tangentOffset, uint uvOffset,
+       uint uv1Offset, uint colorOffset, uint colorFormat,
        IntPtr indexBuffer, uint indexFormat, uint indexByteOffset,
        uint triangleCount);
     [DllImport(PluginName)] public static extern int MetalRT_SetSharedBuffers

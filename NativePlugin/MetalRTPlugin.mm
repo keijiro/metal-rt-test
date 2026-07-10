@@ -57,7 +57,8 @@ struct MeshEntry
     id<MTLBuffer> vertexBuffer;
     id<MTLBuffer> indexBuffer;
     uint32_t vertexStride, positionOffset, normalOffset, tangentOffset;
-    uint32_t uvOffset, indexFormat;
+    uint32_t uvOffset, uv1Offset, colorOffset, colorFormat;
+    uint32_t indexFormat;
 };
 
 // Written on the main thread during setup (before any render event fires),
@@ -136,7 +137,8 @@ struct MaterialDesc
     float emission[4];  // linear
     float baseMapST[4]; // xy: scale, zw: offset
     float metallic, smoothness;
-    uint32_t hasBaseMap, pad;
+    float cutoff;       // alpha clip threshold; < 0 disables clipping
+    uint32_t hasBaseMap;
     uint64_t texture;   // MTLTexture pointer or 0
     uint64_t pad2;
 };
@@ -171,7 +173,8 @@ struct GpuInstanceInfo
 {
     uint64_t vertices, indices;
     uint32_t vertexStride, positionOffset, normalOffset, tangentOffset;
-    uint32_t uvOffset, indexFormat, materialIndex, pad;
+    uint32_t uvOffset, uv1Offset, colorOffset, colorFormat;
+    uint32_t indexFormat, materialIndex, pad0, pad1;
     float objectToWorld[3][4];
     float normalMatrix[3][4];
 };
@@ -183,8 +186,8 @@ struct GpuMaterial
     float baseColor[4];
     float emission[4];
     float baseMapST[4];
-    float metallic, smoothness;
-    uint32_t hasBaseMap, pad;
+    float metallic, smoothness, cutoff;
+    uint32_t hasBaseMap;
     MTLResourceID baseMap;
     uint64_t pad2;
 };
@@ -244,7 +247,8 @@ struct InstanceInfo
     device const uchar* vertices;
     device const uchar* indices;
     uint vertexStride, positionOffset, normalOffset, tangentOffset;
-    uint uvOffset, indexFormat, materialIndex, pad;
+    uint uvOffset, uv1Offset, colorOffset, colorFormat;
+    uint indexFormat, materialIndex, pad0, pad1;
     float4 objectToWorld0, objectToWorld1, objectToWorld2;
     float4 normalMatrix0, normalMatrix1, normalMatrix2;
 };
@@ -254,8 +258,8 @@ struct GpuMaterial
     float4 baseColor;
     float4 emission;
     float4 baseMapST;
-    float metallic, smoothness;
-    uint hasBaseMap, pad;
+    float metallic, smoothness, cutoff;
+    uint hasBaseMap;
     texture2d<float> baseMap;
     ulong pad2;
 };
@@ -282,8 +286,9 @@ struct HitAttributes
     float4 position; // xyz: world position
     float4 normal;   // xyz: world shading normal (faces the ray origin)
     float4 tangent;  // xyz: world tangent, w: bitangent sign
-    float4 uvView;   // xy: uv0
+    float4 uvView;   // xy: uv0, zw: uv1
     float4 viewDir;  // xyz: direction toward the ray origin
+    float4 color;    // vertex color ((1,1,1,1) when absent)
     uint4 meta;      // x: material index, y: hit flag
 };
 
@@ -292,7 +297,8 @@ struct SurfaceRecord
     float4 baseColor; // rgb: linear albedo
     float4 normal;    // xyz: world shading normal
     float4 emission;  // rgb: linear radiance
-    float4 params;    // x: metallic, y: smoothness
+    float4 params;    // x: metallic, y: smoothness,
+                      // z: alpha, w: clip threshold (< 0: no clipping)
 };
 
 // --- RNG (PCG) ---
@@ -602,38 +608,70 @@ kernel void GeomPrep
             tangent = float4(normalize(tw), ts.w);
         }
 
-        // UV0
+        // UV channels
         float2 uv = float2(0);
         if (info.uvOffset != 0xffffffffu)
         {
-            float2 uv0 = LoadFloat2Attr(info, info.uvOffset, tri.x);
-            float2 uv1 = LoadFloat2Attr(info, info.uvOffset, tri.y);
-            float2 uv2 = LoadFloat2Attr(info, info.uvOffset, tri.z);
-            uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+            float2 a = LoadFloat2Attr(info, info.uvOffset, tri.x);
+            float2 b = LoadFloat2Attr(info, info.uvOffset, tri.y);
+            float2 c = LoadFloat2Attr(info, info.uvOffset, tri.z);
+            uv = a * bary.x + b * bary.y + c * bary.z;
+        }
+        float2 uv1 = float2(0);
+        if (info.uv1Offset != 0xffffffffu)
+        {
+            float2 a = LoadFloat2Attr(info, info.uv1Offset, tri.x);
+            float2 b = LoadFloat2Attr(info, info.uv1Offset, tri.y);
+            float2 c = LoadFloat2Attr(info, info.uv1Offset, tri.z);
+            uv1 = a * bary.x + b * bary.y + c * bary.z;
+        }
+
+        // Vertex color (Float32x4 or UNorm8x4)
+        float4 color = float4(1);
+        if (info.colorOffset != 0xffffffffu)
+        {
+            float4 c0, c1, c2;
+            if (info.colorFormat == 0)
+            {
+                c0 = LoadFloat4Attr(info, info.colorOffset, tri.x);
+                c1 = LoadFloat4Attr(info, info.colorOffset, tri.y);
+                c2 = LoadFloat4Attr(info, info.colorOffset, tri.z);
+            }
+            else
+            {
+                device const uchar* p = info.vertices + info.colorOffset;
+                uint s = info.vertexStride;
+                c0 = float4(*(device const uchar4*)(p + s * tri.x)) / 255;
+                c1 = float4(*(device const uchar4*)(p + s * tri.y)) / 255;
+                c2 = float4(*(device const uchar4*)(p + s * tri.z)) / 255;
+            }
+            color = c0 * bary.x + c1 * bary.y + c2 * bary.z;
         }
 
         attr.position = float4(path.origin.xyz +
                                path.direction.xyz * hit.distance, 1);
         attr.normal = float4(n, 0);
         attr.tangent = tangent;
-        attr.uvView = float4(uv, 0, 0);
+        attr.uvView = float4(uv, uv1);
         attr.viewDir = float4(-path.direction.xyz, 0);
+        attr.color = color;
         attr.meta = uint4(info.materialIndex, 1, 0, 0);
 
         // Default URP Lit surface evaluation
         constant GpuMaterial& mat = materials[info.materialIndex];
-        float3 baseColor = mat.baseColor.xyz;
+        float4 baseColor = mat.baseColor;
         if (mat.hasBaseMap != 0 && info.uvOffset != 0xffffffffu)
         {
             float2 st = uv * mat.baseMapST.xy + mat.baseMapST.zw;
             constexpr sampler smp(address::repeat, filter::linear,
                                   mip_filter::linear);
-            baseColor *= mat.baseMap.sample(smp, st, level(2)).xyz;
+            baseColor *= mat.baseMap.sample(smp, st, level(2));
         }
-        surf.baseColor = float4(baseColor, 1);
+        surf.baseColor = float4(baseColor.xyz, 1);
         surf.normal = float4(n, 0);
         surf.emission = mat.emission;
-        surf.params = float4(mat.metallic, mat.smoothness, 0, 0);
+        surf.params = float4(mat.metallic, mat.smoothness,
+                             baseColor.w, mat.cutoff);
     }
 
     attributes[idx] = attr;
@@ -666,6 +704,17 @@ kernel void Shade
 
     SurfaceRecord surf = surfaces[idx];
     float3 position = attr.position.xyz;
+
+    // Alpha clipped hit: pass through (continue the ray past the surface;
+    // this consumes one bounce iteration). Shadow rays still treat clipped
+    // geometry as opaque (documented limitation).
+    if (surf.params.w >= 0 && surf.params.z < surf.params.w)
+    {
+        path.origin.xyz = position + path.direction.xyz * kRayEpsilon;
+        paths[idx] = path;
+        return;
+    }
+
     float3 normal = normalize(surf.normal.xyz);
 
     uint rng = as_type<uint>(path.throughput.w);
@@ -910,6 +959,9 @@ MTLInstanceAccelerationStructureDescriptor* CreateInstanceDescriptor
         info.normalOffset = mesh.normalOffset;
         info.tangentOffset = mesh.tangentOffset;
         info.uvOffset = mesh.uvOffset;
+        info.uv1Offset = mesh.uv1Offset;
+        info.colorOffset = mesh.colorOffset;
+        info.colorFormat = mesh.colorFormat;
         info.indexFormat = mesh.indexFormat;
         info.materialIndex = std::max(src.materialIndex, 0);
         std::memcpy(info.objectToWorld, src.objectToWorld,
@@ -1196,6 +1248,7 @@ int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_AddMesh
   (void* vertexBuffer, uint32_t vertexStride, uint32_t positionOffset,
    uint32_t normalOffset, uint32_t tangentOffset, uint32_t uvOffset,
+   uint32_t uv1Offset, uint32_t colorOffset, uint32_t colorFormat,
    void* indexBuffer, uint32_t indexFormat, uint32_t indexByteOffset,
    uint32_t triangleCount)
 {
@@ -1215,6 +1268,9 @@ MetalRT_AddMesh
     mesh.normalOffset = normalOffset;
     mesh.tangentOffset = tangentOffset;
     mesh.uvOffset = uvOffset;
+    mesh.uv1Offset = uv1Offset;
+    mesh.colorOffset = colorOffset;
+    mesh.colorFormat = colorFormat;
     mesh.indexFormat = indexFormat;
 
     MTLAccelerationStructureTriangleGeometryDescriptor* geometry =
@@ -1263,6 +1319,7 @@ MetalRT_SetMaterials(const MaterialDesc* materials, int32_t count)
         std::memcpy(mat.baseColor, src.baseColor, sizeof(float) * 12);
         mat.metallic = src.metallic;
         mat.smoothness = src.smoothness;
+        mat.cutoff = src.cutoff;
         mat.hasBaseMap = 0;
         if (src.hasBaseMap != 0 && src.texture != 0)
         {

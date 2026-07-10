@@ -37,10 +37,19 @@ public sealed class PathTracerTest : MonoBehaviour
 
     const float ProbeTolerance = 0.02f;
 
-    // Furnace test sphere, far above the scene (only the analytic tests'
-    // virtual camera looks at it).
+    // Off-scene test objects (only the analytic tests' virtual camera
+    // looks at them).
     static readonly Vector3 FurnaceCenter = new Vector3(0, 50, 0);
     const float FurnaceScale = 2; // base radius 0.5 -> radius 1
+    static readonly Vector3 VertexColorCenter = new Vector3(30, 50, 0);
+    static readonly Vector3 CutoutCenter = new Vector3(60, 50, 0);
+    const float TestQuadScale = 2; // quad extent +-1 -> +-2
+
+    static readonly Color32[] QuadCorners =
+    {
+        new Color32(255, 0, 0, 255), new Color32(0, 255, 0, 255),
+        new Color32(0, 0, 255, 255), new Color32(255, 255, 255, 255)
+    };
 
     const int TestFrames = 32;   // accumulation frames per analytic test
     const int SaveFrame = 300;   // progressive frame to save the PNG at
@@ -61,6 +70,7 @@ public sealed class PathTracerTest : MonoBehaviour
     Mesh[] _meshes = new Mesh[0];
     Material[] _materials;
     MetalRTPathTracer.MaterialCompute _procedural;
+    MetalRTPathTracer.MaterialCompute _sgCompute;
     int _tracedFrames;
 
     static MetalRTPathTracer Tracer => MetalRTPathTracer.Instance;
@@ -113,7 +123,8 @@ public sealed class PathTracerTest : MonoBehaviour
         var plane = LoadAndRegisterMesh("Plane");
         var torus = LoadAndRegisterMesh("Torus");
         var sphere = LoadAndRegisterMesh("Sphere");
-        if (plane < 0 || torus < 0 || sphere < 0) return false;
+        var quad = RegisterMesh(MakeQuadMesh(QuadCorners), "RuntimeQuad");
+        if (plane < 0 || torus < 0 || sphere < 0 || quad < 0) return false;
 
         // The floor uses the test Shader Graph: URP rasterizes it with the
         // graph's own shader while the path tracer evaluates the compute
@@ -128,9 +139,13 @@ public sealed class PathTracerTest : MonoBehaviour
         glowMat.SetColor("_EmissionColor", new Color(4, 3, 1.5f));
         var furnaceMat = MakeLitMaterial(new Color(0.735357f, 0.735357f,
                                                    0.735357f), 0, 0); // rho=0.5
+        // Magenta fallbacks: visible if the material computes fail to run.
+        var vcMat = MakeLitMaterial(Color.magenta, 0, 0.2f);
+        var cutoutMat = MakeLitMaterial(Color.magenta, 0, 0.2f);
 
         _materials = new[]
-          { floorMat, torusMat, metalMat, whiteMat, glowMat, furnaceMat };
+          { floorMat, torusMat, metalMat, whiteMat, glowMat, furnaceMat,
+            vcMat, cutoutMat };
 
         // Initial transforms must match the probe expectations above.
         _instances = new[]
@@ -147,6 +162,10 @@ public sealed class PathTracerTest : MonoBehaviour
               new Vector3(-0.9f, 0.25f, -1.3f), 0.5f)),
             (sphere, 5, Spawn("Furnace Sphere", sphere, furnaceMat,
               FurnaceCenter, FurnaceScale)),
+            (quad, 6, Spawn("Vertex Color Quad", quad, vcMat,
+              VertexColorCenter, TestQuadScale)),
+            (quad, 7, Spawn("Cutout Quad", quad, cutoutMat,
+              CutoutCenter, TestQuadScale)),
         };
 
         _light = new GameObject("Directional Light", typeof(Light))
@@ -251,9 +270,11 @@ public sealed class PathTracerTest : MonoBehaviour
     // BLAS construction from a non-readable mesh asset
 
     int LoadAndRegisterMesh(string resourceName)
+      => RegisterMesh(Resources.Load<Mesh>(resourceName), resourceName);
+
+    int RegisterMesh(Mesh mesh, string name)
     {
-        var mesh = Resources.Load<Mesh>(resourceName);
-        Log($"Mesh {resourceName}: {mesh.vertexCount} verts, isReadable = " +
+        Log($"Mesh {name}: {mesh.vertexCount} verts, isReadable = " +
             $"{mesh.isReadable} (expected False)");
 
         var posStream = mesh.GetVertexAttributeStream(VertexAttribute.Position);
@@ -266,7 +287,7 @@ public sealed class PathTracerTest : MonoBehaviour
             mesh.GetTopology(0) != MeshTopology.Triangles ||
             mesh.GetBaseVertex(0) != 0)
         {
-            Log($"FAIL: Unsupported mesh layout in {resourceName}");
+            Log($"FAIL: Unsupported mesh layout in {name}");
             return -1;
         }
 
@@ -276,6 +297,9 @@ public sealed class PathTracerTest : MonoBehaviour
                                             posStream, 4);
         var uvOffset = AttributeOffset(mesh, VertexAttribute.TexCoord0,
                                        posStream, 2);
+        var uv1Offset = AttributeOffset(mesh, VertexAttribute.TexCoord1,
+                                        posStream, 2);
+        var (colorOffset, colorFormat) = ColorAttribute(mesh, posStream);
 
         var indexCount = mesh.GetIndexCount(0);
         var indexStart = mesh.GetIndexStart(0);
@@ -285,21 +309,65 @@ public sealed class PathTracerTest : MonoBehaviour
         var ret = MetalRT_AddMesh
           (mesh.GetNativeVertexBufferPtr(posStream), (uint)stride,
            (uint)posOffset, normalOffset, tangentOffset, uvOffset,
+           uv1Offset, colorOffset, colorFormat,
            mesh.GetNativeIndexBufferPtr(),
            is16Bit ? 0u : 1u, indexStart * indexSize, indexCount / 3);
 
         if (ret < 0)
         {
-            Log($"FAIL: BLAS build error {ret} for {resourceName}: {LastError}");
+            Log($"FAIL: BLAS build error {ret} for {name}: {LastError}");
             return -1;
         }
 
-        Log($"BLAS #{ret} built from non-readable mesh {resourceName} " +
+        Log($"BLAS #{ret} built from non-readable mesh {name} " +
             $"({indexCount / 3} triangles): OK");
 
         Array.Resize(ref _meshes, ret + 1);
         _meshes[ret] = mesh;
         return ret;
+    }
+
+    // Vertex color attribute offset and format (0: Float32x4, 1: UNorm8x4).
+    static (uint offset, uint format) ColorAttribute(Mesh mesh, int stream)
+    {
+        if (!mesh.HasVertexAttribute(VertexAttribute.Color) ||
+            mesh.GetVertexAttributeStream(VertexAttribute.Color) != stream ||
+            mesh.GetVertexAttributeDimension(VertexAttribute.Color) != 4)
+            return (NoAttribute, 0);
+        var offset = (uint)mesh.GetVertexAttributeOffset(VertexAttribute.Color);
+        return mesh.GetVertexAttributeFormat(VertexAttribute.Color) switch
+        {
+            VertexAttributeFormat.Float32 => (offset, 0u),
+            VertexAttributeFormat.UNorm8 => (offset, 1u),
+            _ => (NoAttribute, 0u)
+        };
+    }
+
+    // Runtime-built quad (extent +-1 in XY, facing -Z) with vertex colors
+    // and UVs, made non-readable on upload — this also exercises the
+    // runtime-mesh flavor of the non-readable GPU buffer path.
+    static Mesh MakeQuadMesh(Color32[] cornerColors)
+    {
+        var mesh = new Mesh();
+        mesh.vertices = new[]
+        {
+            new Vector3(-1, -1, 0), new Vector3(1, -1, 0),
+            new Vector3(1, 1, 0), new Vector3(-1, 1, 0)
+        };
+        mesh.normals = new[]
+        {
+            new Vector3(0, 0, -1), new Vector3(0, 0, -1),
+            new Vector3(0, 0, -1), new Vector3(0, 0, -1)
+        };
+        mesh.uv = new[]
+        {
+            new Vector2(0, 0), new Vector2(1, 0),
+            new Vector2(1, 1), new Vector2(0, 1)
+        };
+        mesh.colors32 = cornerColors;
+        mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
+        mesh.UploadMeshData(true); // no longer readable
+        return mesh;
     }
 
     static uint AttributeOffset(Mesh mesh, VertexAttribute attr,
@@ -337,6 +405,9 @@ public sealed class PathTracerTest : MonoBehaviour
                   mat.GetFloat("_Metallic") : 0,
                 smoothness = mat.HasProperty("_Smoothness") ?
                   mat.GetFloat("_Smoothness") : 0.5f,
+                cutoff = mat.IsKeywordEnabled("_ALPHATEST_ON") &&
+                         mat.HasProperty("_Cutoff") ?
+                  mat.GetFloat("_Cutoff") : -1,
                 hasBaseMap = tex != null ? 1u : 0u,
                 texture = tex != null ?
                   tex.GetNativeTexturePtr().ToInt64() : 0
@@ -479,10 +550,22 @@ public sealed class PathTracerTest : MonoBehaviour
                 "(run MetalRT/Generate Compute From Test Graph)");
             return false;
         }
-        Tracer.MaterialComputes.Add
-          (MakeShaderGraphCompute(sgCompute, _materials[0], 0));
+        _sgCompute = MakeShaderGraphCompute(sgCompute, _materials[0], 0);
+        Tracer.MaterialComputes.Add(_sgCompute);
         Log("Shader Graph material compute registered (material 0, " +
             "generated from TestGraph.shadergraph)");
+
+        // Off-scene test material evaluators (vertex color, alpha cutout)
+        var vcCs = Resources.Load<ComputeShader>("TestVertexColor");
+        Tracer.MaterialComputes.Add(new MetalRTPathTracer.MaterialCompute
+          { Shader = vcCs, Kernel = vcCs.FindKernel("EvaluateMaterial"),
+            MaterialIndex = 6 });
+        var cutCs = Resources.Load<ComputeShader>("TestCutout");
+        Tracer.MaterialComputes.Add(new MetalRTPathTracer.MaterialCompute
+          { Shader = cutCs, Kernel = cutCs.FindKernel("EvaluateMaterial"),
+            MaterialIndex = 7 });
+        Log("Vertex color / cutout material computes registered " +
+            "(materials 6, 7)");
         return true;
     }
 
@@ -568,8 +651,7 @@ public sealed class PathTracerTest : MonoBehaviour
 
     IEnumerator RunTestSequence()
     {
-        var sgCompute = Tracer.MaterialComputes.Count > 1 ?
-          Tracer.MaterialComputes[^1] : null;
+        var sgCompute = _sgCompute;
 
         // Expected linear floor albedo at a world point: checker base map
         // sample times the base color tint (cell interiors only).
@@ -691,6 +773,69 @@ public sealed class PathTracerTest : MonoBehaviour
             _materials[0].SetColor("_BaseColor", Color.white);
         }
 
+        // T5: vertex color input path. A runtime-built quad with UNorm8
+        // vertex colors is evaluated by a compute shader reading
+        // VertexColor. The pixel at a triangle centroid must equal the
+        // barycentric average of its corner colors (furnace setup: uniform
+        // env, no light, flat quad -> radiance = albedo * env exactly).
+        s = ProductionSettings();
+        s.envColor = env;
+        s.lightColor = Color.black;
+        s.maxBounces = 2;
+        s.linearOutput = true;
+        s.debugFlags = 1; // diffuse only
+        Tracer.Settings = s;
+        var t5Camera = LookAtParams(VertexColorCenter + new Vector3(0, 0, -4),
+                                    VertexColorCenter);
+        Tracer.CameraOverride = t5Camera;
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            // Centroid of triangle (v0, v1, v2): corners red, green, blue.
+            var world = VertexColorCenter +
+              new Vector3(1f / 3, -1f / 3, 0) * TestQuadScale;
+            var albedo = ((Color)QuadCorners[0] + QuadCorners[1] +
+                          QuadCorners[2]) / 3;
+            albedo.a = 1;
+            var expected = (Color)(albedo * env);
+            expected.a = 1;
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t5Camera, world), 2);
+            CheckClose("T5 vertex color input (runtime quad)", measured,
+                       expected, 0.03f);
+        }
+
+        // T6: alpha clip pass-through. The cutout quad clips half its
+        // checker cells: clipped cells show the environment behind, solid
+        // cells behave like a flat furnace surface.
+        var t6Camera = LookAtParams(CutoutCenter + new Vector3(0, 0, -4),
+                                    CutoutCenter);
+        Tracer.CameraOverride = t6Camera;
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            // uv (0.25, 0.25): cell sum even -> alpha 0 -> clipped.
+            var clipped = CutoutCenter +
+              new Vector3(-0.5f, -0.5f, 0) * TestQuadScale;
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t6Camera, clipped), 2);
+            CheckClose("T6a alpha clip (clipped cell = env)", measured,
+                       env, 0.03f);
+
+            // uv (0.75, 0.25): cell sum odd -> alpha 1 -> solid.
+            var solid = CutoutCenter +
+              new Vector3(0.5f, -0.5f, 0) * TestQuadScale;
+            var albedo = new Color(0.6f, 0.6f, 0.6f); // TestCutout.compute
+            var expected = (Color)(albedo * env);
+            measured = ReadResultAverage(VirtualCameraPixel(t6Camera, solid), 2);
+            CheckClose("T6b alpha clip (solid cell = albedo*env)", measured,
+                       expected, 0.03f);
+        }
+
         // Production: progressive path tracing of the visible scene.
         Tracer.Settings = ProductionSettings();
         Tracer.CameraOverride = null;
@@ -715,6 +860,23 @@ public sealed class PathTracerTest : MonoBehaviour
             p.x >= result.width - 2 || p.y >= result.height - 2)
             Log($"WARNING: test point {worldPos} projects off screen ({p})");
         return p;
+    }
+
+    // Projects a world point through a virtual camera (TraceParams) into
+    // result texture pixel coordinates.
+    static Vector2Int VirtualCameraPixel(in TraceParams p, Vector3 world)
+    {
+        Vector3 origin = p.originTan;
+        Vector3 fwd = p.forward, right = p.rightAspect, up = p.up;
+        var tan = p.originTan.w;
+        var aspect = p.rightAspect.w;
+        var d = world - origin;
+        var z = Vector3.Dot(d, fwd);
+        var ndcX = Vector3.Dot(d, right) / z / (tan * aspect);
+        var ndcY = Vector3.Dot(d, up) / z / tan;
+        return new Vector2Int(
+            Mathf.RoundToInt((ndcX * 0.5f + 0.5f) * p.width),
+            Mathf.RoundToInt((ndcY * 0.5f + 0.5f) * p.height));
     }
 
     TraceParams LookAtParams(Vector3 position, Vector3 target)

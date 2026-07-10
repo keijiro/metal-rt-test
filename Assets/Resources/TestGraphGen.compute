@@ -150,6 +150,7 @@ struct HitAttributes
     float4 tangent;
     float4 uvView;
     float4 viewDir;
+    float4 color;
     uint4 meta;
 };
 
@@ -191,6 +192,6 @@ void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
     s.baseColor = float4(d.BaseColor, 1);
     s.normal = float4(nWS, 0);
     s.emission = float4(d.Emission, 0);
-    s.params = float4(d.Metallic, d.Smoothness, 0, 0);
+    s.params = float4(d.Metallic, d.Smoothness, 1, -1);
     _Surfaces[idx] = s;
 }

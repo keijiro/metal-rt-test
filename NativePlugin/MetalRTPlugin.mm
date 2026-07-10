@@ -49,6 +49,8 @@ id<MTLComputePipelineState> s_IntersectPipeline;
 id<MTLComputePipelineState> s_GeomPrepPipeline;
 id<MTLComputePipelineState> s_ShadePipeline;
 id<MTLComputePipelineState> s_ResolvePipeline;
+id<MTLComputePipelineState> s_AtrousPipeline;
+id<MTLComputePipelineState> s_OutputPipeline;
 id<MTLComputePipelineState> s_ProbePipeline;
 
 struct MeshEntry
@@ -77,7 +79,14 @@ id<MTLBuffer> s_SharedSurfaces;
 // Native-only per-frame resources (render thread)
 id<MTLBuffer> s_PathBuffer;
 id<MTLBuffer> s_AccumBuffer;
+id<MTLBuffer> s_GBuffer;   // primary hit albedo + normal (denoiser guides)
+id<MTLBuffer> s_DenoiseA;  // irradiance ping-pong buffers
+id<MTLBuffer> s_DenoiseB;
 uint32_t s_BufferWidth, s_BufferHeight;
+uint32_t s_AccumFrames; // frames since the last accumulation reset
+
+constexpr uint32_t kDenoiseFrameLimit = 64; // stop filtering once converged
+constexpr int kDenoiseIterations = 3;
 
 // Per-frame state carried across the phase events of one frame
 // (render thread only).
@@ -758,6 +767,7 @@ kernel void Shade
    constant uint& bounce [[buffer(5)]],
    constant InstanceInfo* instances [[buffer(6)]],
    constant GpuMaterial* materials [[buffer(7)]],
+   device float4* gbuffer [[buffer(8)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
@@ -769,6 +779,11 @@ kernel void Shade
     HitAttributes attr = attributes[idx];
     if (attr.meta.y == 0)
     {
+        if (bounce == 0) // denoiser guides: environment pixel
+        {
+            gbuffer[idx * 2] = float4(1, 1, 1, 1);
+            gbuffer[idx * 2 + 1] = float4(0);
+        }
         path.radiance.xyz += path.throughput.xyz * frame.envColor.xyz;
         path.radiance.w = 0;
         paths[idx] = path;
@@ -779,16 +794,27 @@ kernel void Shade
     float3 position = attr.position.xyz;
 
     // Alpha clipped hit: pass through (continue the ray past the surface;
-    // this consumes one bounce iteration). Shadow rays still treat clipped
-    // geometry as opaque (documented limitation).
+    // this consumes one bounce iteration). Shadow rays evaluate the alpha
+    // of native Lit materials; compute-evaluated clipping stays opaque.
     if (surf.params.w >= 0 && surf.params.z < surf.params.w)
     {
+        if (bounce == 0)
+        {
+            gbuffer[idx * 2] = float4(1, 1, 1, 1);
+            gbuffer[idx * 2 + 1] = float4(0);
+        }
         path.origin.xyz = position + path.direction.xyz * kRayEpsilon;
         paths[idx] = path;
         return;
     }
 
     float3 normal = normalize(surf.normal.xyz);
+
+    if (bounce == 0) // denoiser guides: primary hit albedo and normal
+    {
+        gbuffer[idx * 2] = float4(surf.baseColor.xyz, 1);
+        gbuffer[idx * 2 + 1] = float4(normal, 0);
+    }
 
     uint rng = as_type<uint>(path.throughput.w);
     float3 wo = -path.direction.xyz;
@@ -873,11 +899,14 @@ static float3 TonemapAces(float3 x)
     return saturate(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14));
 }
 
+// Accumulates the frame and writes the albedo-demodulated irradiance mean
+// (the denoiser filters irradiance so texture detail is preserved).
 kernel void Resolve
   (device const PathState* paths [[buffer(0)]],
    device float4* accum [[buffer(1)]],
    constant FrameConstants& frame [[buffer(2)]],
-   texture2d<float, access::write> output [[texture(0)]],
+   device const float4* gbuffer [[buffer(3)]],
+   device float4* irradiance [[buffer(4)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
@@ -888,8 +917,72 @@ kernel void Resolve
     acc.w += 1;
     accum[idx] = acc;
 
+    float3 mean = acc.xyz / acc.w;
+    float3 albedo = max(gbuffer[idx * 2].xyz, 0.05);
+    irradiance[idx] = float4(mean / albedo, 1);
+}
+
+// Edge-avoiding a-trous wavelet filter step over the irradiance buffer,
+// guided by the primary hit albedo and normal.
+kernel void Atrous
+  (device const float4* source [[buffer(0)]],
+   device float4* destination [[buffer(1)]],
+   device const float4* gbuffer [[buffer(2)]],
+   constant FrameConstants& frame [[buffer(3)]],
+   constant uint& step [[buffer(4)]],
+   uint2 id [[thread_position_in_grid]])
+{
+    uint w = frame.cam.width, h = frame.cam.height;
+    if (id.x >= w || id.y >= h) return;
+    uint idx = id.y * w + id.x;
+
+    constexpr float taps[5] = { 1.0 / 16, 1.0 / 4, 3.0 / 8, 1.0 / 4,
+                                1.0 / 16 };
+
+    float3 albedo = gbuffer[idx * 2].xyz;
+    float3 normal = gbuffer[idx * 2 + 1].xyz;
+    float3 center = source[idx].xyz;
+
+    float3 sum = 0;
+    float weightSum = 0;
+    for (int dy = -2; dy <= 2; dy++)
+    for (int dx = -2; dx <= 2; dx++)
+    {
+        int2 q = clamp(int2(id) + int2(dx, dy) * (int)step,
+                       int2(0), int2(w - 1, h - 1));
+        uint qi = q.y * w + q.x;
+        float weight = taps[dx + 2] * taps[dy + 2];
+        if (dx != 0 || dy != 0)
+        {
+            float3 qn = gbuffer[qi * 2 + 1].xyz;
+            float3 da = gbuffer[qi * 2].xyz - albedo;
+            float3 dc = source[qi].xyz - center;
+            weight *= pow(max(dot(normal, qn), 0.0), 32.0);
+            weight *= exp(-dot(da, da) / 0.02);
+            weight *= exp(-dot(dc, dc) / 0.25);
+        }
+        sum += source[qi].xyz * weight;
+        weightSum += weight;
+    }
+    destination[idx] = float4(sum / max(weightSum, 1e-6), 1);
+}
+
+// Remodulates the (possibly filtered) irradiance with the albedo and
+// writes the display value into the output texture.
+kernel void Output
+  (device const float4* irradiance [[buffer(0)]],
+   device const float4* gbuffer [[buffer(1)]],
+   constant FrameConstants& frame [[buffer(2)]],
+   texture2d<float, access::write> output [[texture(0)]],
+   uint2 id [[thread_position_in_grid]])
+{
+    if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
+    uint idx = id.y * frame.cam.width + id.x;
+
+    float3 albedo = max(gbuffer[idx * 2].xyz, 0.05);
+    float3 color = irradiance[idx].xyz * albedo;
+
     // Output stays linear; Unity's sRGB conversion happens at display time.
-    float3 color = acc.xyz / acc.w;
     if (frame.linearOutput == 0)
         color = TonemapAces(color * frame.exposure);
     output.write(float4(color, 1), id);
@@ -993,10 +1086,13 @@ bool EnsurePipelines()
     s_GeomPrepPipeline = CreatePipeline(library, @"GeomPrep");
     s_ShadePipeline = CreatePipeline(library, @"Shade");
     s_ResolvePipeline = CreatePipeline(library, @"Resolve");
+    s_AtrousPipeline = CreatePipeline(library, @"Atrous");
+    s_OutputPipeline = CreatePipeline(library, @"Output");
     s_ProbePipeline = CreatePipeline(library, @"TraceProbes");
     return s_ClearPipeline != nil && s_RayGenPipeline != nil &&
            s_IntersectPipeline != nil && s_GeomPrepPipeline != nil &&
            s_ShadePipeline != nil && s_ResolvePipeline != nil &&
+           s_AtrousPipeline != nil && s_OutputPipeline != nil &&
            s_ProbePipeline != nil;
 }
 
@@ -1128,6 +1224,12 @@ void EnsurePathBuffers(uint32_t width, uint32_t height)
                                          options:MTLResourceStorageModePrivate];
     s_AccumBuffer = [s_Device newBufferWithLength:pixels * 16
                                           options:MTLResourceStorageModePrivate];
+    s_GBuffer = [s_Device newBufferWithLength:pixels * 32
+                                      options:MTLResourceStorageModePrivate];
+    s_DenoiseA = [s_Device newBufferWithLength:pixels * 16
+                                       options:MTLResourceStorageModePrivate];
+    s_DenoiseB = [s_Device newBufferWithLength:pixels * 16
+                                       options:MTLResourceStorageModePrivate];
     s_BufferWidth = width;
     s_BufferHeight = height;
 }
@@ -1225,6 +1327,7 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
 
         if (ev->reset != 0 || resized)
         {
+            s_AccumFrames = 0;
             [enc setComputePipelineState:s_ClearPipeline];
             [enc setBuffer:s_AccumBuffer offset:0 atIndex:0];
             [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:1];
@@ -1291,6 +1394,7 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
         [enc setBytes:&bounce length:sizeof(bounce) atIndex:5];
         [enc setBuffer:s_FrameInfo offset:0 atIndex:6];
         [enc setBuffer:s_MaterialBuffer offset:0 atIndex:7];
+        [enc setBuffer:s_GBuffer offset:0 atIndex:8];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
         [enc endEncoding];
         [command commit];
@@ -1307,11 +1411,41 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
         [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
         [enc setBuffer:s_AccumBuffer offset:0 atIndex:1];
         [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:2];
+        [enc setBuffer:s_GBuffer offset:0 atIndex:3];
+        [enc setBuffer:s_DenoiseA offset:0 atIndex:4];
+        [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        barrier(enc);
+
+        // Edge-avoiding a-trous denoising during early accumulation only;
+        // analytic (linear output) modes and converged frames pass through.
+        int iterations = (s_Frame.linearOutput == 0 &&
+                          s_AccumFrames < kDenoiseFrameLimit) ?
+          kDenoiseIterations : 0;
+        id<MTLBuffer> src = s_DenoiseA, dst = s_DenoiseB;
+        for (int i = 0; i < iterations; i++)
+        {
+            uint32_t step = 1u << i;
+            [enc setComputePipelineState:s_AtrousPipeline];
+            [enc setBuffer:src offset:0 atIndex:0];
+            [enc setBuffer:dst offset:0 atIndex:1];
+            [enc setBuffer:s_GBuffer offset:0 atIndex:2];
+            [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:3];
+            [enc setBytes:&step length:sizeof(step) atIndex:4];
+            [enc dispatchThreads:grid threadsPerThreadgroup:group];
+            barrier(enc);
+            auto tmp = src; src = dst; dst = tmp;
+        }
+
+        [enc setComputePipelineState:s_OutputPipeline];
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:s_GBuffer offset:0 atIndex:1];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:2];
         [enc setTexture:s_FrameTexture atIndex:0];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
         [enc endEncoding];
         [command commit];
 
+        s_AccumFrames++;
         s_EventFrames.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -1537,10 +1671,14 @@ void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
     s_SharedSurfaces = nil;
     s_PathBuffer = nil;
     s_AccumBuffer = nil;
+    s_GBuffer = nil;
+    s_DenoiseA = nil;
+    s_DenoiseB = nil;
     s_FrameTlas = nil;
     s_FrameInfo = nil;
     s_FrameTexture = nil;
     s_BufferWidth = s_BufferHeight = 0;
+    s_AccumFrames = 0;
     s_EventFrames.store(0, std::memory_order_relaxed);
 }
 

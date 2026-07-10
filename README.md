@@ -60,9 +60,17 @@ project.
     materials**, overwriting surface records for their material indices.
   - **URP/Lit BSDF**: Lambert diffuse + GGX specular with the URP
     metallic/smoothness convention, cosine / GGX-NDF importance sampling
-    with lobe selection, and next event estimation for the directional
-    light via shadow rays (intensity premultiplied by pi to match Unity's
-    punctual light convention).
+    with lobe selection, and next event estimation over the scene's
+    punctual lights — directional, point, and spot with URP's attenuation
+    conventions (inverse square with smooth range window, squared
+    smoothstep spot falloff), intensity premultiplied by pi. Shadow rays
+    evaluate the base map alpha of alpha-clipped Lit materials (up to four
+    transparent layers), so cutout materials cast correct shadows.
+  - **Denoiser**: during early accumulation (< 64 frames) the resolve
+    stage runs an edge-avoiding a-trous wavelet filter over the
+    albedo-demodulated irradiance, guided by primary-hit albedo and normal,
+    then remodulates — texture detail stays sharp while GI noise smooths
+    out. Converged frames and the analytic test modes bypass the filter.
   - **Bindless resources** (Metal 3): mesh buffers are referenced by
     `gpuAddress` and material base maps by `gpuResourceID` from
     plain-buffer-resident tables, with explicit `useResource` residency.
@@ -95,15 +103,19 @@ project.
   the raw command buffer for `IssuePluginEventAndData` and the material
   dispatches, then the result is blitted onto the camera color target.
   Accumulation restarts automatically when the camera moves.
+- `Assets/Scripts/MetalRTSceneRegistry.cs` — Automatic scene registration:
+  scans the scene's MeshRenderers and registers BLASes for unique meshes,
+  the material table, per-frame instance descriptors, and generated Shader
+  Graph computes (resolved by naming convention, shader "X/Name" ->
+  Resources "NameGen") with a generic property/keyword binder.
 - `Assets/Scripts/PathTracerTest.cs` — The test harness. It builds a static
-  URP scene at runtime; the left camera rasterizes it normally while the
-  right camera uses the renderer with the path tracer feature. The floor
-  uses `Assets/Shaders/TestGraph.shadergraph` (a texture-mapped Lit graph)
+  URP scene at runtime (registration is automatic); the left camera
+  rasterizes it normally while the right camera uses the renderer with the
+  path tracer feature. The floor uses `Assets/Shaders/TestGraph.shadergraph`
   rasterized by URP on the left and evaluated by its generated compute
-  shader in the path tracer on the right. Material properties are bound to
-  the generated compute generically from the shader's property list. A
-  hand-written SurfaceDescription-style compute (`TestProcedural.compute`)
-  drives the small torus as a second material evaluator.
+  shader in the path tracer on the right. Hand-written
+  SurfaceDescription-style computes drive additional test materials
+  (procedural pattern, vertex color with a keyword variant, alpha cutout).
 - `Assets/Scripts/MetalRTPlugin.cs` — P/Invoke interop and the event data
   blob writer (a small ring of unmanaged blobs passes per-frame camera,
   lighting, and instance transforms to the render thread).
@@ -141,8 +153,15 @@ Analytic tests (logged as PASS/FAIL to the console on play):
 - **T6 alpha clipping**: a cutout quad clips half its checker cells via
   `Alpha` / `AlphaClipThreshold`; clipped cells must show the environment
   behind (**0.00 %**) and solid cells behave like a flat furnace surface
-  (**0.00 %**). Shadow rays treat clipped geometry as opaque (known
-  limitation).
+  (**0.00 %**).
+- **T7 keyword variants**: toggling a keyword on the material switches the
+  evaluated compute variant (**0.42 %**).
+- **T8 punctual lights**: point and spot lighting on a flat receiver match
+  URP's attenuation formulas analytically (**0.01 %** each).
+- **T9 alpha-tested shadows**: swapping `_Cutoff` around a half-alpha
+  occluder toggles a point light's shadow between fully transparent
+  (**0.04 %**) and fully opaque (**exact zero**). Clipping that exists only
+  in compute-evaluated materials still shadows as opaque (limitation).
 
 All of the above run through the URP renderer feature (RenderGraph unsafe
 pass), not a standalone dispatch path.
@@ -164,13 +183,14 @@ physically correct mirror reflections).
 Note: the macOS editor never unloads native plugins, so restart the editor
 after rebuilding the plugin.
 
-## Roadmap
+## Possible future work
 
-- **Keyword variants**: support Shader Graph keyword variants in the
-  generated compute shaders (multi_compile + per-material keyword binding).
-- **Scene integration**: register scene meshes/materials automatically
-  (renderer component scan) instead of the hand-built test scene, support
-  more lights (point/spot/area), and denoise the progressive output.
-- **Alpha-tested shadows**: shadow rays currently treat alpha-clipped
-  geometry as opaque; proper support needs material evaluation on the
-  occlusion path (e.g., Metal intersection function tables).
+The original roadmap (keyword variants, automatic scene registration,
+punctual lights, alpha-tested shadows, denoising) is complete. Natural next
+directions:
+
+- Transparency and refraction (transmission BSDF, non-opaque intersection)
+- Emissive mesh light sampling (NEE with MIS instead of BSDF-only)
+- Skinned/dynamic meshes (BLAS refit per frame)
+- Multiple UV channels beyond uv1, HDR environment maps
+- A higher-quality denoiser (temporal reprojection, or ML-based)

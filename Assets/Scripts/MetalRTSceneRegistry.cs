@@ -63,6 +63,10 @@ public sealed class MetalRTSceneRegistry
     public MetalRTPathTracer.MaterialCompute ComputeOf(Material material)
       => _materialComputes.TryGetValue(material, out var c) ? c : null;
 
+    // Re-uploads the native material table (call after changing Lit
+    // material properties consumed by the native evaluation).
+    public bool RefreshMaterials() => UploadMaterials();
+
     // Per-frame TLAS instance descriptors from the current transforms.
     public InstanceDesc[] MakeDescs()
     {

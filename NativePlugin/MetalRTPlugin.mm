@@ -697,6 +697,58 @@ kernel void GeomPrep
     surfaces[idx] = surf;
 }
 
+// Shadow ray visibility with alpha-test transparency for materials in the
+// native Lit table (cutoff >= 0). Materials evaluated by Unity compute
+// shaders keep their table cutoff (usually opaque). Up to 4 transparent
+// layers; more counts as occluded.
+static bool ShadowVisible
+  (instance_acceleration_structure accel,
+   constant InstanceInfo* instances,
+   constant GpuMaterial* materials,
+   float3 origin, float3 dir, float maxDist)
+{
+    float minDist = 0;
+    for (int iter = 0; iter < 4; iter++)
+    {
+        ray r;
+        r.origin = origin;
+        r.direction = dir;
+        r.min_distance = minDist;
+        r.max_distance = maxDist;
+
+        intersector<triangle_data, instancing> isect;
+        intersection_result<triangle_data, instancing> hit =
+          isect.intersect(r, accel, 0xffu);
+        if (hit.type == intersection_type::none) return true;
+
+        constant InstanceInfo& info = instances[hit.instance_id];
+        constant GpuMaterial& mat = materials[info.materialIndex];
+        if (mat.cutoff < 0) return false; // opaque
+
+        float alpha = mat.baseColor.w;
+        if (mat.hasBaseMap != 0 && info.uvOffset != 0xffffffffu)
+        {
+            uint3 tri = LoadTriangleIndices(info, hit.primitive_id);
+            float3 bary = float3(1 - hit.triangle_barycentric_coord.x -
+                                 hit.triangle_barycentric_coord.y,
+                                 hit.triangle_barycentric_coord.x,
+                                 hit.triangle_barycentric_coord.y);
+            float2 a = LoadFloat2Attr(info, info.uvOffset, tri.x);
+            float2 b = LoadFloat2Attr(info, info.uvOffset, tri.y);
+            float2 c = LoadFloat2Attr(info, info.uvOffset, tri.z);
+            float2 uv = a * bary.x + b * bary.y + c * bary.z;
+            float2 st = uv * mat.baseMapST.xy + mat.baseMapST.zw;
+            constexpr sampler smp(address::repeat, filter::linear,
+                                  mip_filter::linear);
+            alpha *= mat.baseMap.sample(smp, st, level(2)).w;
+        }
+        if (alpha >= mat.cutoff) return false;
+
+        minDist = hit.distance + kRayEpsilon; // pass through
+    }
+    return false;
+}
+
 kernel void Shade
   (instance_acceleration_structure accel [[buffer(0)]],
    device PathState* paths [[buffer(1)]],
@@ -704,6 +756,8 @@ kernel void Shade
    device const SurfaceRecord* surfaces [[buffer(3)]],
    constant FrameConstants& frame [[buffer(4)]],
    constant uint& bounce [[buffer(5)]],
+   constant InstanceInfo* instances [[buffer(6)]],
+   constant GpuMaterial* materials [[buffer(7)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
@@ -782,18 +836,8 @@ kernel void Shade
         if (nol <= 0 || atten <= 0 ||
             Luminance(light.color.xyz) <= 0) continue;
 
-        ray shadow;
-        shadow.origin = position + normal * kRayEpsilon;
-        shadow.direction = wl;
-        shadow.min_distance = 0;
-        shadow.max_distance = shadowMax;
-
-        intersector<triangle_data, instancing> occ;
-        occ.accept_any_intersection(true);
-        intersection_result<triangle_data, instancing> sh =
-          occ.intersect(shadow, accel, 0xffu);
-
-        if (sh.type == intersection_type::none)
+        if (ShadowVisible(accel, instances, materials,
+                          position + normal * kRayEpsilon, wl, shadowMax))
             path.radiance.xyz += path.throughput.xyz *
               EvalBsdf(bsdf, normal, wo, wl) * nol *
               light.color.xyz * atten;
@@ -1245,6 +1289,8 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
         [enc setBuffer:s_SharedSurfaces offset:0 atIndex:3];
         [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:4];
         [enc setBytes:&bounce length:sizeof(bounce) atIndex:5];
+        [enc setBuffer:s_FrameInfo offset:0 atIndex:6];
+        [enc setBuffer:s_MaterialBuffer offset:0 atIndex:7];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
         [enc endEncoding];
         [command commit];

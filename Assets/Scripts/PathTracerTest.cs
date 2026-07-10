@@ -31,6 +31,7 @@ public sealed class PathTracerTest : MonoBehaviour
     static readonly Vector3 VertexColorCenter = new Vector3(30, 50, 0);
     static readonly Vector3 CutoutCenter = new Vector3(60, 50, 0);
     static readonly Vector3 PunctualCenter = new Vector3(90, 50, 0);
+    static readonly Vector3 ShadowCenter = new Vector3(120, 50, 0);
     const float TestQuadScale = 2; // quad extent +-1 -> +-2
 
     static readonly Color32[] QuadCorners =
@@ -54,10 +55,12 @@ public sealed class PathTracerTest : MonoBehaviour
     Camera _ptCamera; // right half: URP camera with the path tracer feature
     Light _light;
     Light _pointLight, _spotLight; // T8 test lights (disabled by default)
+    Light _shadowLight;            // T9 test light (disabled by default)
     MetalRTSceneRegistry _registry;
 
     Material _floorMat, _torusMat, _metalMat, _whiteMat, _glowMat,
-             _furnaceMat, _vcMat, _cutoutMat, _punctualMat;
+             _furnaceMat, _vcMat, _cutoutMat, _punctualMat,
+             _shadowRecvMat, _shadowOccMat;
     Transform _floorT, _torusT, _metalT, _whiteT, _glowT, _furnaceT,
               _vcT, _cutoutT, _punctualT;
 
@@ -164,6 +167,22 @@ public sealed class PathTracerTest : MonoBehaviour
         _punctualT = Spawn("Punctual Quad", quad, _punctualMat,
                            PunctualCenter, TestQuadScale);
 
+        // Alpha-tested shadow setup (T9): a gray receiver with a small
+        // alpha-clipped occluder next to a point light. The occluder's
+        // base map alpha is 0.5; the test swaps _Cutoff around it.
+        _shadowRecvMat = MakeLitMaterial(new Color(0.5f, 0.5f, 0.5f), 0, 0.2f);
+        Spawn("Shadow Receiver", quad, _shadowRecvMat,
+              ShadowCenter, TestQuadScale);
+        _shadowOccMat = MakeLitMaterial(Color.white, 0, 0.2f);
+        _shadowOccMat.EnableKeyword("_ALPHATEST_ON");
+        _shadowOccMat.SetFloat("_Cutoff", 0.8f);
+        var halfAlpha = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+        halfAlpha.SetPixel(0, 0, new Color(1, 1, 1, 0.5f));
+        halfAlpha.Apply(false, true);
+        _shadowOccMat.SetTexture("_BaseMap", halfAlpha);
+        Spawn("Shadow Occluder", quad, _shadowOccMat,
+              ShadowCenter + new Vector3(0, 0, -2.7f), 0.3f);
+
         _light = new GameObject("Directional Light", typeof(Light))
                    .GetComponent<Light>();
         _light.type = LightType.Directional;
@@ -189,6 +208,14 @@ public sealed class PathTracerTest : MonoBehaviour
         _spotLight.spotAngle = 60;
         _spotLight.innerSpotAngle = 40;
         _spotLight.enabled = false;
+
+        _shadowLight = new GameObject("Test Shadow Light", typeof(Light))
+                         .GetComponent<Light>();
+        _shadowLight.type = LightType.Point;
+        _shadowLight.transform.position = ShadowCenter + new Vector3(0, 0, -3);
+        _shadowLight.range = 10;
+        _shadowLight.intensity = 2;
+        _shadowLight.enabled = false;
 
         RenderSettings.ambientMode = AmbientMode.Flat;
         RenderSettings.ambientLight = new Color(0.15f, 0.17f, 0.22f);
@@ -707,6 +734,66 @@ public sealed class PathTracerTest : MonoBehaviour
         }
 
         _spotLight.enabled = false;
+
+        // T9: alpha-tested shadows. The half-alpha occluder sits between
+        // the point light and the receiver; swapping _Cutoff around the
+        // 0.5 base map alpha toggles it between shadow-transparent and
+        // shadow-opaque (native Lit alpha evaluation on the shadow path).
+        // The camera is elevated so primary rays miss the small occluder.
+        var t9Camera = LookAtParams(ShadowCenter + new Vector3(0, 2, -8),
+                                    ShadowCenter);
+        _shadowLight.enabled = true;
+
+        Color ShadowExpected()
+        {
+            var albedo = _shadowRecvMat.GetColor("_BaseColor").linear;
+            const float d2 = 9;
+            var r2 = _shadowLight.range * _shadowLight.range;
+            var window = Mathf.Pow
+              (Mathf.Clamp01(1 - (d2 / r2) * (d2 / r2)), 2);
+            var c = _shadowLight.color.linear * _shadowLight.intensity *
+                    (window / d2);
+            return albedo * c;
+        }
+
+        // Phase A: cutoff above the base map alpha -> shadow rays pass.
+        _shadowOccMat.SetFloat("_Cutoff", 0.8f);
+        _registry.RefreshMaterials();
+        s = ProductionSettings(); // shadow point light only
+        s.envColor = Color.black;
+        s.maxBounces = 1;
+        s.linearOutput = true;
+        s.debugFlags = 1;
+        Tracer.Settings = s;
+        Tracer.CameraOverride = t9Camera;
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t9Camera, ShadowCenter), 2);
+            CheckClose("T9a alpha-tested shadow (transparent occluder)",
+                       measured, ShadowExpected(), 0.03f);
+        }
+
+        // Phase B: cutoff below the base map alpha -> shadow rays blocked.
+        _shadowOccMat.SetFloat("_Cutoff", 0.3f);
+        _registry.RefreshMaterials();
+        Tracer.RequestReset();
+
+        for (var i = 0; i < TestFrames; i++) yield return null;
+
+        {
+            var measured = ReadResultAverage
+              (VirtualCameraPixel(t9Camera, ShadowCenter), 2);
+            CheckClose("T9b alpha-tested shadow (opaque occluder)",
+                       measured, Color.black, 0.03f);
+        }
+
+        _shadowOccMat.SetFloat("_Cutoff", 0.8f);
+        _registry.RefreshMaterials();
+        _shadowLight.enabled = false;
         _light.enabled = true;
 
         // Production: progressive path tracing of the visible scene.

@@ -67,6 +67,22 @@ public sealed class MetalRTSceneRegistry
     // material properties consumed by the native evaluation).
     public bool RefreshMaterials() => UploadMaterials();
 
+    // Gathers the scene's enabled punctual lights (up to MaxLights).
+    public static LightDesc[] CollectLights()
+    {
+        var lights = UnityEngine.Object.FindObjectsByType<Light>
+          (FindObjectsSortMode.InstanceID);
+        var list = new List<LightDesc>();
+        foreach (var l in lights)
+        {
+            if (!l.isActiveAndEnabled || list.Count >= MaxLights) continue;
+            if (l.type != LightType.Directional && l.type != LightType.Point &&
+                l.type != LightType.Spot) continue;
+            list.Add(MakeLightDesc(l));
+        }
+        return list.ToArray();
+    }
+
     // Per-frame TLAS instance descriptors from the current transforms.
     public InstanceDesc[] MakeDescs()
     {

@@ -20,7 +20,14 @@ public sealed class PathTracerTest : MonoBehaviour
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
-      => new GameObject("Metal RT Test", typeof(PathTracerTest));
+    {
+        // Scenes that drive the path tracer themselves (e.g., the sample
+        // scene with MetalRTPathTracerRunner) skip the test harness.
+        if (FindObjectsByType<MetalRTPathTracerRunner>
+              (FindObjectsInactive.Include, FindObjectsSortMode.None)
+              .Length > 0) return;
+        new GameObject("Metal RT Test", typeof(PathTracerTest));
+    }
 
     const float ProbeTolerance = 0.02f;
 
@@ -253,20 +260,8 @@ public sealed class PathTracerTest : MonoBehaviour
         exposure = 1
     };
 
-    // Gathers the scene's enabled punctual lights (up to MaxLights).
     static LightDesc[] CollectLights()
-    {
-        var lights = FindObjectsByType<Light>(FindObjectsSortMode.InstanceID);
-        var list = new System.Collections.Generic.List<LightDesc>();
-        foreach (var l in lights)
-        {
-            if (!l.isActiveAndEnabled || list.Count >= MaxLights) continue;
-            if (l.type != LightType.Directional && l.type != LightType.Point &&
-                l.type != LightType.Spot) continue;
-            list.Add(MakeLightDesc(l));
-        }
-        return list.ToArray();
-    }
+      => MetalRTSceneRegistry.CollectLights();
 
     // Directional light contribution used by floor test expectations.
     (Vector3 toLight, Color color) DirLight()

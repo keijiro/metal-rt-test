@@ -174,14 +174,21 @@ physically correct mirror reflections).
 
 ## How to run
 
-1. Build the plugin: `NativePlugin/build.sh` (requires Xcode Command Line
-   Tools; outputs `Assets/Plugins/macOS/libMetalRTTest.dylib`).
-2. Open the project with Unity 6000.3.19f1 and enter play mode. Test results
-   are logged to the console with a `[MetalRT]` prefix; a converged frame is
-   saved to `Output/rt-result.png`.
+Requirements: an Apple Silicon Mac with hardware ray tracing (M3 or later)
+and Unity 6000.3.19f1. The prebuilt native plugin is included; to rebuild
+it, run `NativePlugin/build.sh` (Xcode Command Line Tools) and restart the
+editor (the macOS editor never unloads native plugins).
 
-Note: the macOS editor never unloads native plugins, so restart the editor
-after rebuilding the plugin.
+**Sample scene**: open `Assets/Scenes/Sample.unity` and press play. The
+left half shows URP rasterization, the right half the path traced view of
+the same scene (`MetalRTPathTracerRunner` registers the scene's renderers
+and lights automatically; tweak bounces/exposure on the runner object).
+
+**Test suite**: enter play mode in a scene *without* a
+`MetalRTPathTracerRunner` (e.g., an empty scene) — the test harness
+bootstraps itself, runs the probe and T1-T9 analytic checks (logged with a
+`[MetalRT]` prefix), and then renders progressively, saving a converged
+frame to `Output/rt-result.png`.
 
 ## Possible future work
 

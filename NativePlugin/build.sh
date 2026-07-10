@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 
 UNITY_APP=/Applications/Unity/Hub/Editor/6000.3.19f1/Unity.app
 PLUGIN_API="$UNITY_APP/Contents/PluginAPI"
-OUT_DIR=../Assets/Plugins/macOS
+OUT_DIR=../Packages/jp.keijiro.urp-metal-path-tracer/Runtime/Plugins
 
 mkdir -p "$OUT_DIR"
 
@@ -16,6 +16,6 @@ xcrun clang++ -std=c++17 -fobjc-arc -O2 -shared \
   -arch arm64 -mmacosx-version-min=13.0 \
   -isystem "$PLUGIN_API" \
   -framework Metal -framework Foundation \
-  -o "$OUT_DIR/libMetalRTTest.dylib" MetalRTPlugin.mm
+  -o "$OUT_DIR/libMetalPathTracer.dylib" MetalRTPlugin.mm
 
-echo "Built $OUT_DIR/libMetalRTTest.dylib"
+echo "Built $OUT_DIR/libMetalPathTracer.dylib"

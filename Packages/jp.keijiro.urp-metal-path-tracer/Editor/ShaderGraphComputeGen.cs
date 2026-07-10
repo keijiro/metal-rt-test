@@ -7,7 +7,7 @@ using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
 
-namespace MetalRTTest.Editor {
+namespace UrpMetalPathTracer.Editor {
 
 // Generates a material evaluation compute shader for the Metal RT path
 // tracer from a Shader Graph asset. The graph's SurfaceDescriptionFunction
@@ -18,17 +18,34 @@ namespace MetalRTTest.Editor {
 // the "conditional Shader Graph support" boundary.
 public static class ShaderGraphComputeGen
 {
-    const string GraphPath = "Assets/Shaders/TestGraph.shadergraph";
-    const string OutputPath = "Assets/Resources/TestGraphGen.compute";
+    // The generated compute goes to Assets/Resources so the scene registry
+    // can resolve it at runtime by naming convention ("NameGen").
+    public static string OutputPathFor(string graphPath)
+      => "Assets/Resources/" +
+         System.IO.Path.GetFileNameWithoutExtension(graphPath) +
+         "Gen.compute";
 
-    [MenuItem("MetalRT/Generate Compute From Test Graph")]
-    public static void GenerateTestGraph()
+    [MenuItem("Assets/URP Metal Path Tracer/Generate Material Compute", true)]
+    static bool ValidateGenerateSelected()
+      => Selection.assetGUIDs.Any(g => AssetDatabase.GUIDToAssetPath(g)
+                                        .EndsWith(".shadergraph"));
+
+    [MenuItem("Assets/URP Metal Path Tracer/Generate Material Compute")]
+    static void GenerateSelected()
     {
-        var error = Generate(GraphPath, OutputPath);
-        if (error == null)
-            Debug.Log($"[MetalRT] Generated {OutputPath} from {GraphPath}");
-        else
-            Debug.LogError($"[MetalRT] Generation failed: {error}");
+        System.IO.Directory.CreateDirectory("Assets/Resources");
+        foreach (var guid in Selection.assetGUIDs)
+        {
+            var path = AssetDatabase.GUIDToAssetPath(guid);
+            if (!path.EndsWith(".shadergraph")) continue;
+            var output = OutputPathFor(path);
+            var error = Generate(path, output);
+            if (error == null)
+                Debug.Log($"[MetalRT] Generated {output} from {path}");
+            else
+                Debug.LogError($"[MetalRT] Generation failed for {path}: " +
+                               error);
+        }
     }
 
     // Supported SurfaceDescriptionInputs fields and the expressions that
@@ -299,8 +316,9 @@ void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
         return fields;
     }
 
-    // Regenerates the compute shader whenever a shader graph under
-    // Assets/Shaders is (re)imported.
+    // Regenerates the compute shader whenever a shader graph with an
+    // existing generated counterpart is (re)imported. Initial generation
+    // is opt-in through the "Generate Material Compute" context menu.
     sealed class Postprocessor : AssetPostprocessor
     {
         static void OnPostprocessAllAssets(string[] imported, string[] deleted,
@@ -308,16 +326,14 @@ void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
         {
             foreach (var path in imported)
             {
-                if (!path.StartsWith("Assets/Shaders/") ||
-                    !path.EndsWith(".shadergraph")) continue;
+                if (!path.EndsWith(".shadergraph")) continue;
+                var output = OutputPathFor(path);
+                if (!System.IO.File.Exists(output)) continue;
                 var captured = path;
                 // Defer: importing the generated asset from within a
                 // postprocessor callback is not allowed.
                 EditorApplication.delayCall += () =>
                 {
-                    var name = System.IO.Path.GetFileNameWithoutExtension
-                      (captured);
-                    var output = $"Assets/Resources/{name}Gen.compute";
                     var error = Generate(captured, output);
                     if (error == null)
                         Debug.Log($"[MetalRT] Regenerated {output} " +
@@ -352,4 +368,4 @@ void EvaluateMaterial(uint3 id : SV_DispatchThreadID)
     }
 }
 
-} // namespace MetalRTTest.Editor
+} // namespace UrpMetalPathTracer.Editor

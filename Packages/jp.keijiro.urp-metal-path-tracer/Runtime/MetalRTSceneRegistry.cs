@@ -2,9 +2,9 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
-using static MetalRTTest.MetalRTPlugin;
+using static UrpMetalPathTracer.MetalRTPlugin;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
 // Scans the scene's MeshRenderers and registers everything the path tracer
 // needs: BLASes for each unique (non-readable) mesh, the material table,
@@ -412,4 +412,4 @@ public sealed class MetalRTSceneRegistry
     };
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

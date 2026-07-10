@@ -1,8 +1,8 @@
 using UnityEngine;
 using UnityEngine.Rendering;
-using static MetalRTTest.MetalRTPlugin;
+using static UrpMetalPathTracer.MetalRTPlugin;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
 // Minimal scene component that drives the Metal RT path tracer without the
 // test harness: put this in a scene (see Assets/Scenes/Sample.unity), give
@@ -105,4 +105,4 @@ public sealed class MetalRTPathTracerRunner : MonoBehaviour
 #endif
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

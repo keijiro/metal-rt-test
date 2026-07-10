@@ -1,0 +1,13 @@
+{
+  "name": "jp.keijiro.urp-metal-path-tracer",
+  "version": "0.1.0",
+  "displayName": "URP Metal Path Tracer",
+  "description": "Hardware-accelerated path tracer for URP on macOS (Apple Silicon), built on Metal ray tracing with conditional Shader Graph support.",
+  "unity": "6000.3",
+  "author": "Keijiro Takahashi",
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.3.0"
+  },
+  "changelogUrl": "https://github.com/keijiro/metal-rt-test/blob/main/CHANGELOG.md",
+  "documentationUrl": "https://github.com/keijiro/metal-rt-test"
+}

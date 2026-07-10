@@ -3,7 +3,7 @@ using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
 // URP renderer feature that replaces the camera's color output with the
 // Metal RT path traced image. The pass records the native phase events and
@@ -59,4 +59,4 @@ sealed class MetalRTPathTracerPass : ScriptableRenderPass
     }
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

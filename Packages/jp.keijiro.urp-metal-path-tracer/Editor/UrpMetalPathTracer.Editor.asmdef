@@ -1,0 +1,9 @@
+{
+    "name": "UrpMetalPathTracer.Editor",
+    "references": [
+        "UrpMetalPathTracer.Runtime"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ]
+}

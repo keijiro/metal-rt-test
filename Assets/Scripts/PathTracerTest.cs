@@ -4,9 +4,9 @@ using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
-using static MetalRTTest.MetalRTPlugin;
+using static UrpMetalPathTracer.MetalRTPlugin;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
 // Test harness for the Metal RT path tracer. Builds a static URP scene at
 // runtime and lets MetalRTSceneRegistry auto-register everything from the
@@ -911,4 +911,4 @@ public sealed class PathTracerTest : MonoBehaviour
     static Vector4 V4(Vector3 v, float w) => new Vector4(v.x, v.y, v.z, w);
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

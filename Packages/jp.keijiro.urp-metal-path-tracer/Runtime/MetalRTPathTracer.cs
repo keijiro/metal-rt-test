@@ -3,9 +3,9 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
-using static MetalRTTest.MetalRTPlugin;
+using static UrpMetalPathTracer.MetalRTPlugin;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
 // Runtime core of the Metal RT path tracer. Owns the GPU-facing state
 // (result texture, wavefront buffers, event data blobs, material evaluation
@@ -250,4 +250,4 @@ public sealed class MetalRTPathTracer
     static Vector4 V4(Vector3 v, float w) => new Vector4(v.x, v.y, v.z, w);
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

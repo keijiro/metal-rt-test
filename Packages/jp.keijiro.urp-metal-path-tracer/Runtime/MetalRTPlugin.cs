@@ -2,9 +2,9 @@ using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
-namespace MetalRTTest {
+namespace UrpMetalPathTracer {
 
-// P/Invoke interface to the MetalRTTest native plugin.
+// P/Invoke interface to the MetalPathTracer native plugin.
 public static class MetalRTPlugin
 {
     // Interop structs
@@ -120,7 +120,7 @@ public static class MetalRTPlugin
 
     // Native entry points
 
-    const string PluginName = "MetalRTTest";
+    const string PluginName = "MetalPathTracer";
 
     [DllImport(PluginName)] static extern IntPtr MetalRT_GetLastError();
     [DllImport(PluginName)] public static extern int
@@ -199,4 +199,4 @@ public static class MetalRTPlugin
     }
 }
 
-} // namespace MetalRTTest
+} // namespace UrpMetalPathTracer

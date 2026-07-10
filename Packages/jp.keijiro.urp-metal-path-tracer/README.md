@@ -6,11 +6,13 @@ built directly on the Metal ray tracing APIs.
 
 ![comparison](Images/comparison.png)
 
-*Left: URP real-time rasterization. Right: the same view path traced by a
-URP camera with the path tracer renderer feature — soft shadows, GI color
-bleeding, emissive lighting, and mirror reflections. The checkerboard floor
-is a Shader Graph, rasterized with the graph's own shader on the left and
-evaluated by an automatically generated compute shader on the right.*
+*The sample scene (a Cornell-box arrangement with a smoothness ladder of
+metallic and dielectric spheres). Left: URP real-time rasterization. Right:
+the same view path traced by a URP camera with the path tracer renderer
+feature — emissive panel lighting, red/green GI color bleeding, and soft
+shadows. The checkerboard floor is a Shader Graph, rasterized with the
+graph's own shader on the left and evaluated by an automatically generated
+compute shader on the right.*
 
 ## Why this exists
 

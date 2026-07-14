@@ -143,6 +143,9 @@ public static class MetalRTPlugin
       MetalRT_GetRenderEventFunc();
     [DllImport(PluginName)] public static extern int
       MetalRT_GetEventFrameCount();
+    [DllImport(PluginName)] public static extern void
+      MetalRT_SetOidnLibraryPath
+      ([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
     [DllImport(PluginName)] public static extern void MetalRT_Dispose();
 
     public static string LastError

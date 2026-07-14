@@ -13,5 +13,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   (Apple Silicon) built on Metal ray tracing, with URP Lit material
   support, conditional Shader Graph support (generated material
   evaluation compute shaders), punctual lights, alpha-tested shadows,
-  ML denoising with Intel Open Image Denoise (Metal backend), automatic
-  scene registration, and edit mode support.
+  ML denoising with Intel Open Image Denoise (Metal backend, downloaded
+  automatically on first use), automatic scene registration, and edit
+  mode support.

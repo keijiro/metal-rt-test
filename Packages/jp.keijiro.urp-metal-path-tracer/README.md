@@ -39,7 +39,8 @@ unsafe pass — the same integration pattern DLSS-style native plugins use.
   are rejected
 - **Alpha-tested shadows**, **ML denoising** during early accumulation
   with [Intel Open Image Denoise] running on its Metal backend (the
-  official OIDN binaries are bundled with the package), **automatic
+  official OIDN binaries are downloaded into the project `Library`
+  folder on first use, so the package itself stays small), **automatic
   scene registration** (MeshRenderer scan with add/remove/move detection
   and automatic accumulation restart), and **edit mode support**
 

@@ -117,6 +117,11 @@ constexpr int kOidnFormatFloat3 = 3; // OIDN_FORMAT_FLOAT3
 
 OidnApi s_Oidn;
 bool s_OidnTried, s_OidnAvailable, s_OidnFailed;
+// Library path handed over from the managed side (the editor-only installer
+// downloads the official binaries into the project Library folder). Loading
+// is deferred until a path arrives, so a late install still takes effect.
+char s_OidnLibPath[1024];
+std::atomic<bool> s_OidnPathValid {false};
 OIDNDevice s_OidnDevice;
 OIDNFilter s_OidnFilter;
 OIDNBuffer s_OidnColor, s_OidnOutput, s_OidnGuides;
@@ -1231,15 +1236,16 @@ void UseSceneResources(id<MTLComputeCommandEncoder> encoder)
         [encoder useResource:texture usage:MTLResourceUsageRead];
 }
 
-// Loads the bundled Open Image Denoise library (next to this plugin) and
-// resolves the API surface we use. Failure disables denoising gracefully.
+// Loads the Open Image Denoise library from the path provided by the
+// managed side and resolves the API surface we use. Failure disables
+// denoising gracefully.
 bool LoadOidn()
 {
     if (s_OidnTried) return s_OidnAvailable;
+    if (!s_OidnPathValid.load(std::memory_order_acquire)) return false;
     s_OidnTried = true;
 
-    void* lib = dlopen("@loader_path/libOpenImageDenoise.2.5.0.dylib",
-                       RTLD_NOW | RTLD_LOCAL);
+    void* lib = dlopen(s_OidnLibPath, RTLD_NOW | RTLD_LOCAL);
     if (lib == nullptr)
     {
         NSLog(@"[MetalRTPlugin] OIDN unavailable (%s); denoising disabled",
@@ -1758,6 +1764,14 @@ int UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 MetalRT_GetEventFrameCount()
 {
     return s_EventFrames.load(std::memory_order_relaxed);
+}
+
+void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
+MetalRT_SetOidnLibraryPath(const char* path)
+{
+    if (path == nullptr || path[0] == '\0') return;
+    strlcpy(s_OidnLibPath, path, sizeof(s_OidnLibPath));
+    s_OidnPathValid.store(true, std::memory_order_release);
 }
 
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()

@@ -65,6 +65,10 @@ public sealed class MetalRTPathTracer
         _instancesProvider = instancesProvider;
         _eventFunc = MetalRT_GetRenderEventFunc();
 
+#if UNITY_EDITOR
+        OidnInstaller.EnsureInstalled();
+#endif
+
         if (_eventData == null)
         {
             _eventData = new IntPtr[EventRingSize];

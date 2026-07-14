@@ -37,10 +37,13 @@ unsafe pass — the same integration pattern DLSS-style native plugins use.
   driven by UVs (uv0/uv1), vertex color, world-space geometry, view
   direction, time, and keyword variants are supported; screen-space inputs
   are rejected
-- **Alpha-tested shadows**, an **edge-avoiding a-trous denoiser** for early
-  accumulation, **automatic scene registration** (MeshRenderer scan with
-  add/remove/move detection and automatic accumulation restart), and
-  **edit mode support**
+- **Alpha-tested shadows**, **ML denoising** during early accumulation
+  with [Intel Open Image Denoise] running on its Metal backend (the
+  official OIDN binaries are bundled with the package), **automatic
+  scene registration** (MeshRenderer scan with add/remove/move detection
+  and automatic accumulation restart), and **edit mode support**
+
+[Intel Open Image Denoise]: https://www.openimagedenoise.org/
 
 ## System requirements
 
@@ -95,11 +98,13 @@ T1-T9 radiometric checks, logged with a `[MetalRT]` prefix).
 - `NativePlugin/MetalRTPlugin.mm` — runtime-compiled MSL kernels: per-mesh
   BLASes from Unity mesh GPU buffers combined into a per-frame TLAS;
   a wavefront pipeline (RayGen, per-bounce Intersect + GeomPrep + Shade,
-  Resolve with the denoiser) over buffers shared with Unity compute
-  shaders; bindless mesh/texture access (Metal 3 `gpuAddress` /
-  `gpuResourceID`); phase events commit Unity's current command buffer and
-  encode into their own command buffers on Unity's queue
-  (`IUnityGraphicsMetalV2`)
+  Resolve) over buffers shared with Unity compute shaders; bindless
+  mesh/texture access (Metal 3 `gpuAddress` / `gpuResourceID`); phase
+  events commit Unity's current command buffer and encode into their own
+  command buffers on Unity's queue (`IUnityGraphicsMetalV2`); the OIDN
+  device is created on the same queue and its filter runs over shared
+  Metal buffers (color plus albedo/normal guides), so denoising is
+  sequenced by commit order with no extra synchronization
 - `Runtime/MetalRTPathTracer.cs` — owns the GPU-facing state and records
   the phase pipeline; restarts accumulation when the camera, scene
   content, or settings change

@@ -13,6 +13,7 @@ OUT_DIR=../Packages/jp.keijiro.urp-metal-path-tracer/Runtime/Plugins
 mkdir -p "$OUT_DIR"
 
 xcrun clang++ -std=c++17 -fobjc-arc -O2 -shared \
+  -Wl,-rpath,@loader_path \
   -arch arm64 -mmacosx-version-min=13.0 \
   -isystem "$PLUGIN_API" \
   -framework Metal -framework Foundation \

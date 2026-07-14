@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <dlfcn.h>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -50,7 +51,6 @@ id<MTLComputePipelineState> s_IntersectPipeline;
 id<MTLComputePipelineState> s_GeomPrepPipeline;
 id<MTLComputePipelineState> s_ShadePipeline;
 id<MTLComputePipelineState> s_ResolvePipeline;
-id<MTLComputePipelineState> s_AtrousPipeline;
 id<MTLComputePipelineState> s_OutputPipeline;
 id<MTLComputePipelineState> s_ProbePipeline;
 
@@ -82,13 +82,45 @@ id<MTLBuffer> s_SharedSurfaces;
 id<MTLBuffer> s_PathBuffer;
 id<MTLBuffer> s_AccumBuffer;
 id<MTLBuffer> s_GBuffer;   // primary hit albedo + normal (denoiser guides)
-id<MTLBuffer> s_DenoiseA;  // irradiance ping-pong buffers
-id<MTLBuffer> s_DenoiseB;
+id<MTLBuffer> s_DenoiseA;  // accumulated mean color (denoiser input)
+id<MTLBuffer> s_DenoiseB;  // denoised color (denoiser output)
 uint32_t s_BufferWidth, s_BufferHeight;
 uint32_t s_AccumFrames; // frames since the last accumulation reset
 
 constexpr uint32_t kDenoiseFrameLimit = 64; // stop filtering once converged
-constexpr int kDenoiseIterations = 3;
+
+// --- Intel Open Image Denoise (weakly bound via dlopen; falls back to no
+// --- denoising when the bundled library is unavailable) ---
+
+typedef void* OIDNDevice;
+typedef void* OIDNBuffer;
+typedef void* OIDNFilter;
+
+struct OidnApi
+{
+    OIDNDevice (*NewMetalDevice)(const id<MTLCommandQueue>*, int);
+    void (*CommitDevice)(OIDNDevice);
+    int (*GetDeviceError)(OIDNDevice, const char**);
+    OIDNBuffer (*NewSharedBufferFromMetal)(OIDNDevice, id<MTLBuffer>);
+    OIDNFilter (*NewFilter)(OIDNDevice, const char*);
+    void (*SetFilterImage)(OIDNFilter, const char*, OIDNBuffer, int,
+                           size_t, size_t, size_t, size_t, size_t);
+    void (*SetFilterBool)(OIDNFilter, const char*, bool);
+    void (*CommitFilter)(OIDNFilter);
+    void (*ExecuteFilterAsync)(OIDNFilter);
+    void (*ReleaseFilter)(OIDNFilter);
+    void (*ReleaseBuffer)(OIDNBuffer);
+    void (*ReleaseDevice)(OIDNDevice);
+};
+
+constexpr int kOidnFormatFloat3 = 3; // OIDN_FORMAT_FLOAT3
+
+OidnApi s_Oidn;
+bool s_OidnTried, s_OidnAvailable, s_OidnFailed;
+OIDNDevice s_OidnDevice;
+OIDNFilter s_OidnFilter;
+OIDNBuffer s_OidnColor, s_OidnOutput, s_OidnGuides;
+uint32_t s_OidnWidth, s_OidnHeight;
 
 // Per-frame state carried across the phase events of one frame
 // (render thread only).
@@ -896,19 +928,13 @@ kernel void Shade
     paths[idx] = path;
 }
 
-static float3 TonemapAces(float3 x)
-{
-    return saturate(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14));
-}
-
-// Accumulates the frame and writes the albedo-demodulated irradiance mean
-// (the denoiser filters irradiance so texture detail is preserved).
+// Accumulates the frame and writes the running mean color (the denoiser
+// consumes it together with the primary-hit albedo/normal guides).
 kernel void Resolve
   (device const PathState* paths [[buffer(0)]],
    device float4* accum [[buffer(1)]],
    constant FrameConstants& frame [[buffer(2)]],
-   device const float4* gbuffer [[buffer(3)]],
-   device float4* irradiance [[buffer(4)]],
+   device float4* color [[buffer(3)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
@@ -919,75 +945,29 @@ kernel void Resolve
     acc.w += 1;
     accum[idx] = acc;
 
-    float3 mean = acc.xyz / acc.w;
-    float3 albedo = max(gbuffer[idx * 2].xyz, 0.05);
-    irradiance[idx] = float4(mean / albedo, 1);
+    color[idx] = float4(acc.xyz / acc.w, 1);
 }
 
-// Edge-avoiding a-trous wavelet filter step over the irradiance buffer,
-// guided by the primary hit albedo and normal.
-kernel void Atrous
-  (device const float4* source [[buffer(0)]],
-   device float4* destination [[buffer(1)]],
-   device const float4* gbuffer [[buffer(2)]],
-   constant FrameConstants& frame [[buffer(3)]],
-   constant uint& step [[buffer(4)]],
-   uint2 id [[thread_position_in_grid]])
+static float3 TonemapAcesOutput(float3 x)
 {
-    uint w = frame.cam.width, h = frame.cam.height;
-    if (id.x >= w || id.y >= h) return;
-    uint idx = id.y * w + id.x;
-
-    constexpr float taps[5] = { 1.0 / 16, 1.0 / 4, 3.0 / 8, 1.0 / 4,
-                                1.0 / 16 };
-
-    float3 albedo = gbuffer[idx * 2].xyz;
-    float3 normal = gbuffer[idx * 2 + 1].xyz;
-    float3 center = source[idx].xyz;
-
-    float3 sum = 0;
-    float weightSum = 0;
-    for (int dy = -2; dy <= 2; dy++)
-    for (int dx = -2; dx <= 2; dx++)
-    {
-        int2 q = clamp(int2(id) + int2(dx, dy) * (int)step,
-                       int2(0), int2(w - 1, h - 1));
-        uint qi = q.y * w + q.x;
-        float weight = taps[dx + 2] * taps[dy + 2];
-        if (dx != 0 || dy != 0)
-        {
-            float3 qn = gbuffer[qi * 2 + 1].xyz;
-            float3 da = gbuffer[qi * 2].xyz - albedo;
-            float3 dc = source[qi].xyz - center;
-            weight *= pow(max(dot(normal, qn), 0.0), 32.0);
-            weight *= exp(-dot(da, da) / 0.02);
-            weight *= exp(-dot(dc, dc) / 0.25);
-        }
-        sum += source[qi].xyz * weight;
-        weightSum += weight;
-    }
-    destination[idx] = float4(sum / max(weightSum, 1e-6), 1);
+    return saturate(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14));
 }
 
-// Remodulates the (possibly filtered) irradiance with the albedo and
-// writes the display value into the output texture.
+// Writes the (possibly denoised) color into the output texture.
 kernel void Output
-  (device const float4* irradiance [[buffer(0)]],
-   device const float4* gbuffer [[buffer(1)]],
-   constant FrameConstants& frame [[buffer(2)]],
+  (device const float4* color [[buffer(0)]],
+   constant FrameConstants& frame [[buffer(1)]],
    texture2d<float, access::write> output [[texture(0)]],
    uint2 id [[thread_position_in_grid]])
 {
     if (id.x >= frame.cam.width || id.y >= frame.cam.height) return;
     uint idx = id.y * frame.cam.width + id.x;
 
-    float3 albedo = max(gbuffer[idx * 2].xyz, 0.05);
-    float3 color = irradiance[idx].xyz * albedo;
-
     // Output stays linear; Unity's sRGB conversion happens at display time.
+    float3 c = color[idx].xyz;
     if (frame.linearOutput == 0)
-        color = TonemapAces(color * frame.exposure);
-    output.write(float4(color, 1), id);
+        c = TonemapAcesOutput(c * frame.exposure);
+    output.write(float4(c, 1), id);
 }
 
 kernel void TraceProbes
@@ -1088,14 +1068,12 @@ bool EnsurePipelines()
     s_GeomPrepPipeline = CreatePipeline(library, @"GeomPrep");
     s_ShadePipeline = CreatePipeline(library, @"Shade");
     s_ResolvePipeline = CreatePipeline(library, @"Resolve");
-    s_AtrousPipeline = CreatePipeline(library, @"Atrous");
     s_OutputPipeline = CreatePipeline(library, @"Output");
     s_ProbePipeline = CreatePipeline(library, @"TraceProbes");
     return s_ClearPipeline != nil && s_RayGenPipeline != nil &&
            s_IntersectPipeline != nil && s_GeomPrepPipeline != nil &&
            s_ShadePipeline != nil && s_ResolvePipeline != nil &&
-           s_AtrousPipeline != nil && s_OutputPipeline != nil &&
-           s_ProbePipeline != nil;
+           s_OutputPipeline != nil && s_ProbePipeline != nil;
 }
 
 bool RunCommandBuffer(id<MTLCommandBuffer> command)
@@ -1228,14 +1206,16 @@ void EnsurePathBuffers(uint32_t width, uint32_t height)
                                          options:MTLResourceStorageModePrivate];
     s_AccumBuffer = [s_Device newBufferWithLength:pixels * 16
                                           options:MTLResourceStorageModePrivate];
+    // Shared storage so the buffers can be wrapped as OIDN shared buffers.
     s_GBuffer = [s_Device newBufferWithLength:pixels * 32
-                                      options:MTLResourceStorageModePrivate];
+                                      options:MTLResourceStorageModeShared];
     s_DenoiseA = [s_Device newBufferWithLength:pixels * 16
-                                       options:MTLResourceStorageModePrivate];
+                                       options:MTLResourceStorageModeShared];
     s_DenoiseB = [s_Device newBufferWithLength:pixels * 16
-                                       options:MTLResourceStorageModePrivate];
+                                       options:MTLResourceStorageModeShared];
     s_BufferWidth = width;
     s_BufferHeight = height;
+    s_OidnWidth = s_OidnHeight = 0; // rebind the denoiser to the new buffers
 }
 
 void UseSceneResources(id<MTLComputeCommandEncoder> encoder)
@@ -1249,6 +1229,123 @@ void UseSceneResources(id<MTLComputeCommandEncoder> encoder)
     }
     for (id<MTLTexture> texture : s_MaterialTextures)
         [encoder useResource:texture usage:MTLResourceUsageRead];
+}
+
+// Loads the bundled Open Image Denoise library (next to this plugin) and
+// resolves the API surface we use. Failure disables denoising gracefully.
+bool LoadOidn()
+{
+    if (s_OidnTried) return s_OidnAvailable;
+    s_OidnTried = true;
+
+    void* lib = dlopen("@loader_path/libOpenImageDenoise.2.5.0.dylib",
+                       RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr)
+    {
+        NSLog(@"[MetalRTPlugin] OIDN unavailable (%s); denoising disabled",
+              dlerror());
+        return false;
+    }
+
+    auto load = [&](const char* name) { return dlsym(lib, name); };
+    s_Oidn.NewMetalDevice = (OIDNDevice (*)(const id<MTLCommandQueue>*, int))
+      load("oidnNewMetalDevice");
+    s_Oidn.CommitDevice = (void (*)(OIDNDevice))load("oidnCommitDevice");
+    s_Oidn.GetDeviceError = (int (*)(OIDNDevice, const char**))
+      load("oidnGetDeviceError");
+    s_Oidn.NewSharedBufferFromMetal = (OIDNBuffer (*)(OIDNDevice, id<MTLBuffer>))
+      load("oidnNewSharedBufferFromMetal");
+    s_Oidn.NewFilter = (OIDNFilter (*)(OIDNDevice, const char*))
+      load("oidnNewFilter");
+    s_Oidn.SetFilterImage = (void (*)(OIDNFilter, const char*, OIDNBuffer, int,
+                                      size_t, size_t, size_t, size_t, size_t))
+      load("oidnSetFilterImage");
+    s_Oidn.SetFilterBool = (void (*)(OIDNFilter, const char*, bool))
+      load("oidnSetFilterBool");
+    s_Oidn.CommitFilter = (void (*)(OIDNFilter))load("oidnCommitFilter");
+    s_Oidn.ExecuteFilterAsync = (void (*)(OIDNFilter))
+      load("oidnExecuteFilterAsync");
+    s_Oidn.ReleaseFilter = (void (*)(OIDNFilter))load("oidnReleaseFilter");
+    s_Oidn.ReleaseBuffer = (void (*)(OIDNBuffer))load("oidnReleaseBuffer");
+    s_Oidn.ReleaseDevice = (void (*)(OIDNDevice))load("oidnReleaseDevice");
+
+    s_OidnAvailable =
+      s_Oidn.NewMetalDevice && s_Oidn.CommitDevice && s_Oidn.GetDeviceError &&
+      s_Oidn.NewSharedBufferFromMetal && s_Oidn.NewFilter &&
+      s_Oidn.SetFilterImage && s_Oidn.SetFilterBool && s_Oidn.CommitFilter &&
+      s_Oidn.ExecuteFilterAsync && s_Oidn.ReleaseFilter &&
+      s_Oidn.ReleaseBuffer && s_Oidn.ReleaseDevice;
+    if (!s_OidnAvailable)
+        NSLog(@"[MetalRTPlugin] OIDN symbols missing; denoising disabled");
+    return s_OidnAvailable;
+}
+
+bool CheckOidnError(const char* stage)
+{
+    const char* message = nullptr;
+    if (s_Oidn.GetDeviceError(s_OidnDevice, &message) == 0) return true;
+    NSLog(@"[MetalRTPlugin] OIDN error at %s: %s; denoising disabled",
+          stage, message != nullptr ? message : "unknown");
+    s_OidnFailed = true;
+    return false;
+}
+
+void ReleaseOidnFrameObjects()
+{
+    if (s_OidnFilter) { s_Oidn.ReleaseFilter(s_OidnFilter); s_OidnFilter = nullptr; }
+    if (s_OidnColor) { s_Oidn.ReleaseBuffer(s_OidnColor); s_OidnColor = nullptr; }
+    if (s_OidnOutput) { s_Oidn.ReleaseBuffer(s_OidnOutput); s_OidnOutput = nullptr; }
+    if (s_OidnGuides) { s_Oidn.ReleaseBuffer(s_OidnGuides); s_OidnGuides = nullptr; }
+}
+
+// Creates (or resizes) the OIDN RT filter over the shared Metal buffers.
+// The OIDN device runs on Unity's command queue, so denoising is ordered
+// with the surrounding phase command buffers.
+bool EnsureOidnFilter(uint32_t width, uint32_t height)
+{
+    if (s_OidnFailed || !LoadOidn()) return false;
+
+    if (s_OidnDevice == nullptr)
+    {
+        id<MTLCommandQueue> queue = s_UnityQueue;
+        s_OidnDevice = s_Oidn.NewMetalDevice(&queue, 1);
+        if (s_OidnDevice == nullptr)
+        {
+            NSLog(@"[MetalRTPlugin] OIDN Metal device creation failed; "
+                  "denoising disabled");
+            s_OidnFailed = true;
+            return false;
+        }
+        s_Oidn.CommitDevice(s_OidnDevice);
+        if (!CheckOidnError("device commit")) return false;
+        NSLog(@"[MetalRTPlugin] OIDN Metal device initialized");
+    }
+
+    if (s_OidnWidth == width && s_OidnHeight == height &&
+        s_OidnFilter != nullptr) return true;
+
+    ReleaseOidnFrameObjects();
+    s_OidnColor = s_Oidn.NewSharedBufferFromMetal(s_OidnDevice, s_DenoiseA);
+    s_OidnOutput = s_Oidn.NewSharedBufferFromMetal(s_OidnDevice, s_DenoiseB);
+    s_OidnGuides = s_Oidn.NewSharedBufferFromMetal(s_OidnDevice, s_GBuffer);
+    if (!CheckOidnError("shared buffers")) return false;
+
+    s_OidnFilter = s_Oidn.NewFilter(s_OidnDevice, "RT");
+    s_Oidn.SetFilterImage(s_OidnFilter, "color", s_OidnColor,
+                          kOidnFormatFloat3, width, height, 0, 16, 16 * width);
+    s_Oidn.SetFilterImage(s_OidnFilter, "albedo", s_OidnGuides,
+                          kOidnFormatFloat3, width, height, 0, 32, 32 * width);
+    s_Oidn.SetFilterImage(s_OidnFilter, "normal", s_OidnGuides,
+                          kOidnFormatFloat3, width, height, 16, 32, 32 * width);
+    s_Oidn.SetFilterImage(s_OidnFilter, "output", s_OidnOutput,
+                          kOidnFormatFloat3, width, height, 0, 16, 16 * width);
+    s_Oidn.SetFilterBool(s_OidnFilter, "hdr", true);
+    s_Oidn.CommitFilter(s_OidnFilter);
+    if (!CheckOidnError("filter commit")) return false;
+
+    s_OidnWidth = width;
+    s_OidnHeight = height;
+    return true;
 }
 
 // Commits Unity's current command buffer (so everything Unity encoded so
@@ -1416,39 +1513,32 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId, void* data)
         [enc setBuffer:s_PathBuffer offset:0 atIndex:0];
         [enc setBuffer:s_AccumBuffer offset:0 atIndex:1];
         [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:2];
-        [enc setBuffer:s_GBuffer offset:0 atIndex:3];
-        [enc setBuffer:s_DenoiseA offset:0 atIndex:4];
-        [enc dispatchThreads:grid threadsPerThreadgroup:group];
-        barrier(enc);
-
-        // Edge-avoiding a-trous denoising during early accumulation only;
-        // analytic (linear output) modes and converged frames pass through.
-        int iterations = (s_Frame.linearOutput == 0 &&
-                          s_AccumFrames < kDenoiseFrameLimit) ?
-          kDenoiseIterations : 0;
-        id<MTLBuffer> src = s_DenoiseA, dst = s_DenoiseB;
-        for (int i = 0; i < iterations; i++)
-        {
-            uint32_t step = 1u << i;
-            [enc setComputePipelineState:s_AtrousPipeline];
-            [enc setBuffer:src offset:0 atIndex:0];
-            [enc setBuffer:dst offset:0 atIndex:1];
-            [enc setBuffer:s_GBuffer offset:0 atIndex:2];
-            [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:3];
-            [enc setBytes:&step length:sizeof(step) atIndex:4];
-            [enc dispatchThreads:grid threadsPerThreadgroup:group];
-            barrier(enc);
-            auto tmp = src; src = dst; dst = tmp;
-        }
-
-        [enc setComputePipelineState:s_OutputPipeline];
-        [enc setBuffer:src offset:0 atIndex:0];
-        [enc setBuffer:s_GBuffer offset:0 atIndex:1];
-        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:2];
-        [enc setTexture:s_FrameTexture atIndex:0];
+        [enc setBuffer:s_DenoiseA offset:0 atIndex:3];
         [enc dispatchThreads:grid threadsPerThreadgroup:group];
         [enc endEncoding];
         [command commit];
+
+        // OIDN denoising during early accumulation only; analytic (linear
+        // output) modes and converged frames pass through. The OIDN device
+        // runs on Unity's command queue, so commit order sequences the
+        // filter between the resolve and output command buffers.
+        id<MTLBuffer> displaySrc = s_DenoiseA;
+        if (s_Frame.linearOutput == 0 && s_AccumFrames < kDenoiseFrameLimit &&
+            EnsureOidnFilter(width, height))
+        {
+            s_Oidn.ExecuteFilterAsync(s_OidnFilter);
+            if (CheckOidnError("filter execute")) displaySrc = s_DenoiseB;
+        }
+
+        id<MTLCommandBuffer> output = [s_UnityQueue commandBuffer];
+        enc = [output computeCommandEncoder];
+        [enc setComputePipelineState:s_OutputPipeline];
+        [enc setBuffer:displaySrc offset:0 atIndex:0];
+        [enc setBytes:&s_Frame length:sizeof(s_Frame) atIndex:1];
+        [enc setTexture:s_FrameTexture atIndex:0];
+        [enc dispatchThreads:grid threadsPerThreadgroup:group];
+        [enc endEncoding];
+        [output commit];
 
         s_AccumFrames++;
         s_EventFrames.fetch_add(1, std::memory_order_relaxed);
@@ -1673,6 +1763,17 @@ MetalRT_GetEventFrameCount()
 void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API MetalRT_Dispose()
 {
     std::lock_guard<std::mutex> lock(s_SceneMutex);
+    if (s_OidnAvailable)
+    {
+        ReleaseOidnFrameObjects();
+        if (s_OidnDevice)
+        {
+            s_Oidn.ReleaseDevice(s_OidnDevice);
+            s_OidnDevice = nullptr;
+        }
+        s_OidnWidth = s_OidnHeight = 0;
+        s_OidnFailed = false;
+    }
     s_InstanceAS = nil;
     s_InstanceInfo = nil;
     s_MaterialBuffer = nil;
